@@ -1,6 +1,6 @@
-# PandoraPi — Interface Web para Gamepad Bluetooth + Controle CAN (Flipsky 75100 VESC) + LiDAR
+# PandoraPi — Interface Web para Gamepad Bluetooth + Controle CAN (Flipsky 75100 VESC) + LiDAR + GPS A76XX / Trajeto
 
-Aplicação web que transforma um Raspberry Pi em uma central de controle para robôs com tração diferencial usando controladores **Flipsky 75100 (VESC)** conectados via barramento **CAN**. O comando é feito por **gamepad Bluetooth HID** (Nintendo Switch Pro Controller ou qualquer controle compatível com evdev). **LiDAR LDROBOT STL-06P** integrado como radar de navegação com nuvem de pontos 2D persistente (time-decay de 3 segundos).
+Aplicação web que transforma um Raspberry Pi em uma central de controle para robôs com tração diferencial usando controladores **Flipsky 75100 (VESC)** conectados via barramento **CAN**. O comando é feito por **gamepad Bluetooth HID** (Nintendo Switch Pro Controller ou qualquer controle compatível com evdev). **LiDAR LDROBOT STL-06P** integrado como radar de navegação com nuvem de pontos 2D persistente (time-decay de 3 segundos). **GPS via modem SIMCom A76XX LTE** com visualização em mapa Leaflet, constelação de satélites em canvas e gravação de trajeto com exportação JSON.
 
 Todo o sistema roda como um único script Python — Flask + Socket.IO no backend, HTML/CSS/JS inline no frontend, leitura de gamepad via `evdev`, envio de quadros CAN raw via SocketCAN e leitura serial do LiDAR via `pyserial`.
 
@@ -15,6 +15,7 @@ Todo o sistema roda como um único script Python — Flask + Socket.IO no backen
 | 2× Flipsky 75100 VESC | IDs CAN 1 (motor esquerdo) e 2 (motor direito) |
 | Gamepad Bluetooth | Nintendo Switch Pro Controller (testado) ou qualquer controle HID reconhecido pelo kernel Linux via evdev |
 | LiDAR LDROBOT STL-06P | Conectado via USB serial (aparece como `/dev/ttyUSB0`). Baud rate 230400 |
+| SIMCom A76XX LTE Module | Modem com GNSS integrado (GPS, GLONASS, Galileo, BeiDou). Aparece como `/dev/ttyUSB0-3`. GPS via comandos AT em `/dev/ttyUSB1` a 115200 baud |
 
 ## Como funciona
 
@@ -31,6 +32,11 @@ Navegador (http://IP_DO_PI:5005)
 │  Thread: gamepad_reader_loop  │
 │  Lê /dev/input/eventX (evdev) │──► Gamepad Bluetooth (HID)
 │  Emite eventos via Socket.IO  │
+├───────────────────────────────┤
+│  Thread: gps_reader_loop       │
+│  Abre /dev/ttyUSB1 (pyserial)  │──► Modem A76XX
+│  AT+CGNSSPWR=1, AT+CGNSSINFO=1 │    GNSS (GPS/GLONASS/Galileo/BeiDou)
+│  Parse +CGNSSINFO, emite S.IO  │
 ├───────────────────────────────┤
 │  Thread: lidar_reader_loop    │
 │  Lê /dev/ttyUSB0 (pyserial)   │──► LiDAR LDROBOT STL-06P
@@ -71,6 +77,34 @@ alpha = alpha_base × (1 - idade_ms / 3000)
 Isso cria um **"rastro" visual** ao redor do robô, permitindo ao operador enxergar obstáculos mesmo quando o feixe do LiDAR não está apontando diretamente para eles. Anéis de perigo (50cm vermelho tracejado, 1m laranja tracejado) indicam zonas de alerta. O card mostra a distância do obstáculo mais próximo em tempo real.
 
 O sistema funciona **sem odometria** — assume que o robô se move devagar o suficiente para o histórico de 3 segundos ainda ser útil. Para maior precisão com o robô em movimento rápido, seria necessário dead reckoning via encoders (não implementado).
+
+### GPS A76XX — Streaming AT + Parser CGNSSINFO
+
+O modem SIMCom A7670E-MASA usa chipset **ASR** com comandos AT proprietários:
+
+```
+AT+CGNSSPWR=1           # liga o chip GNSS
+AT+CGNSSINFO=1          # inicia streaming contínuo de posição
+```
+
+A resposta `+CGNSSINFO:` contém 19 campos em formato fixo:
+
+```
++CGNSSINFO: 3,15,,05,07,44.2737427,N,9.5367308,E,100526,152328.00,360.2,4.984,89.12,2.63,1.39,2.23,10
+           fix gps glo bd ga  lat    NS lng   EW  date  utc      alt speed hdg pdop hdop vdop tdop sats
+```
+
+O parser `parse_cgnssinfo()` extrai: modo do fix (0/2/3D), latitude/longitude em graus decimais, altitude (m), velocidade (km/h), rumo (graus), satélites por constelação (GPS, GLONASS, BeiDou, Galileo), HDOP/PDOP/VDOP/TDOP.
+
+### Gravação de trajeto
+
+O trajeto é armazenado em memória durante a gravação. Cada ponto contém:
+
+```json
+{"lat": 44.2737, "lng": 9.5367, "alt": 360.2, "speed_kmh": 4.98, "heading": 89.12, "utc_time": "152328.00", "epoch": 1746891130.123}
+```
+
+Funções disponíveis: **Iniciar**, **Pausar**, **Retomar**, **Parar**. O download gera um JSON completo com metadados (tempo de início/fim, total de pontos, distância total calculada).
 
 ## Dependências
 
@@ -143,7 +177,15 @@ Na inicialização o script exibe no terminal todas as instruções de dependên
 5. A métrica **Mais proximo** mostra a distância do obstáculo mais próximo
 6. Anéis vermelho (50cm) e laranja (1m) indicam zonas de perigo ao redor do robô
 
-### 4. Configurar e ativar o CAN
+### 4. Ativar o GPS A76XX
+
+1. Conecte o modem SIMCom A76XX via USB — ele aparece como `/dev/ttyUSB0` a `/dev/ttyUSB3`
+2. O GPS liga automaticamente ao iniciar o servidor (`AT+CGNSSPWR=1` → `AT+CGNSSINFO=1`)
+3. A seção **GPS A76XX + Trajeto** mostra fix, coordenadas, satélites, mapa e controles
+4. Para gravar um trajeto: clique em **Iniciar**, pilote o robô, **Pausar/Retomar** conforme necessário, **Parar** ao finalizar
+5. Clique em **Baixar JSON** para exportar o trajeto completo
+
+### 5. Configurar e ativar o CAN
 
 1. Na seção **CAN / Robô Flipsky 75100**: clique em **Escanear CANable**
 2. Selecione a interface (geralmente `can0`), confira o bitrate (500000)
@@ -154,15 +196,16 @@ Na inicialização o script exibe no terminal todas as instruções de dependên
    - **Botão homem-morto**: por padrão `BTN_TR` (botão R do Pro Controller)
 5. Clique em **ARMAR robô**
 
-### 5. Controlar o robô
+### 6. Controlar o robô
 
 1. Com o robô **armado**, segure o botão homem-morto (R) e mova o analógico esquerdo
 2. Cima/baixo = acelerar/ré; esquerda/direita = girar
 3. Os valores de duty esquerdo e direito aparecem em tempo real na seção CAN
 4. Soltar o botão homem-morto **corta imediatamente** a potência (envia duty 0)
 5. Use o **radar LiDAR** no canto direito para visualizar obstáculos ao redor
+6. Acompanhe a posição GPS e grave o trajeto na seção **GPS A76XX + Trajeto**
 
-### 6. Parada de emergência
+### 7. Parada de emergência
 
 - O botão **PARADA DE EMERGÊNCIA** desarma o robô e envia `duty = 0` para ambos os motores imediatamente
 - Use isso se o robô se comportar de forma inesperada
@@ -185,6 +228,7 @@ Na inicialização o script exibe no terminal todas as instruções de dependên
 | Seção | Função |
 |---|---|
 | **LiDAR LDROBOT STL-06P** | Canvas 420×420px com nuvem de pontos 2D persistente (3s fading). Anéis de perigo 50cm/1m. Métricas: conexão, nº pontos, obstáculo mais próximo, RPM, FPS. Legendas de cor por distância |
+| **GPS A76XX + Trajeto** | Mapa Leaflet com OpenStreetMap, marcador de posição, polyline do trajeto. Métricas: fix (NONE/2D/3D), satélites usados/visíveis, HDOP, lat/lng, altitude, velocidade, rumo. Canvas de constelação de satélites. Controles de gravação: Iniciar/Pausar/Retomar/Parar/Baixar JSON. Log próprio |
 | **Controle visual** | Gamepad visual interativo (compacto): botões A/B/X/Y, D-Pad, analógicos (sticks), gatilhos (triggers), L/R/ZL/ZR, SELECT/HOME/START |
 | **Último evento** | JSON do último evento recebido do gamepad |
 | **Tabelas técnicas** | Lista detalhada de todos os botões e eixos (dentro do Controle visual, toggle) |
@@ -223,6 +267,11 @@ Toda a configuração é salva automaticamente em `gamepad_config.json` (mesmo d
     "min_distance": 150,
     "max_distance": 12000,
     "emit_interval": 0.08
+  },
+  "gps": {
+    "at_port": "/dev/ttyUSB1",
+    "at_baudrate": 115200,
+    "emit_interval": 1.0
   }
 }
 ```
@@ -256,6 +305,14 @@ Toda a configuração é salva automaticamente em `gamepad_config.json` (mesmo d
 | `min_distance` | `150` | Distância mínima de detecção (mm). Pontos abaixo disso são ignorados |
 | `max_distance` | `12000` | Distância máxima de detecção (mm). Pontos acima são ignorados |
 | `emit_interval` | `0.08` | Intervalo mínimo entre envios de frame para o frontend (segundos) |
+
+### Parâmetros GPS
+
+| Parâmetro | Padrão | Descrição |
+|---|---|---|
+| `at_port` | `/dev/ttyUSB1` | Porta serial para comandos AT e streaming GPS (ttyUSB0-3 do modem) |
+| `at_baudrate` | `115200` | Baud rate da porta AT |
+| `emit_interval` | `1.0` | Intervalo mínimo entre atualizações de status (segundos) |
 
 ### Filtro de dispositivos HID
 
@@ -312,6 +369,16 @@ O status do LiDAR aparece no card (OFF → ON quando conectado). Se mostrar `pys
 pip install pyserial
 ```
 
+### GPS não mostra dados
+
+```bash
+ls -l /dev/ttyUSB*                   # O modem aparece?
+sudo picocom -b 115200 /dev/ttyUSB1  # Testar comandos AT
+AT+CGNSSPWR?                         # Verificar se GPS está ligado
+AT+CGNSSINFO                         # Consultar posição manualmente
+sudo cat /dev/ttyUSB3                # Verificar se tem NMEA em outra porta
+```
+
 ### CAN não funciona
 
 ```bash
@@ -338,10 +405,11 @@ sudo apt install python3-evdev
 - A **PARADA DE EMERGÊNCIA** desarma o robô e zera o duty de ambos os motores
 - Sempre tenha um kill switch físico nos VESCs como redundância
 - O LiDAR é **apenas visualização** — não interfere no controle do robô. O operador é responsável por desviar de obstáculos
+- O GPS é um modem SIMCom A76XX — certifique-se de que a porta AT configurada corresponde à porta correta do modem
 
 ## Arquitetura do código
 
-O projeto é um **monolito de arquivo único** (~4650 linhas) contendo:
+O projeto é um **monolito de arquivo único** (~6000 linhas) contendo:
 
 ```
 gamepad_web_can_flipsky.py
@@ -350,27 +418,30 @@ gamepad_web_can_flipsky.py
 ├── HTML_PAGE (template inline com CSS + JS completo)
 ├── Funções auxiliares de sistema (módulos, /proc, /dev/input)
 ├── Gamepad reader (evdev, normalização de eixos, eventos)
+├── GPS reader (pyserial, AT commands, parse CGNSSINFO, gravação de trajeto)
 ├── LiDAR reader (pyserial, protocolo LDROBOT 0x54, CRC, parse)
 ├── Bluetooth (bluetoothctl interativo via subprocess.Popen)
 ├── CAN / SocketCAN (PF_CAN socket, envio de quadros estendidos)
 ├── Lógica do robô (deadman, throttle+steering→duty left/right)
 ├── Rotas Flask (REST API + Socket.IO eventos)
-└── Entry point (threads do gamepad + LiDAR + socketio.run na porta 5005)
+└── Entry point (threads do gamepad + GPS + LiDAR + socketio.run na porta 5005)
 ```
 
 ### Threads
 
 - **Main thread**: servidor Flask + Socket.IO
 - **gamepad_reader_loop** (daemon): loop infinito lendo eventos do `/dev/input/eventX`, reconectando automaticamente se o dispositivo sumir
+- **gps_reader_loop** (daemon): abre porta AT, envia `AT+CGNSSPWR=1` + `AT+CGNSSINFO=1`, faz parsing contínuo de `+CGNSSINFO:`, emite status e grava trajeto
 - **lidar_reader_loop** (daemon): abre porta serial, faz parsing do protocolo LDROBOT, acumula pontos por ângulo (deduplicação por confiança), emite frames a cada ~80ms
 
 ### Comunicação
 
-- **Browser ↔ Servidor**: Socket.IO para eventos em tempo real (status do gamepad, status CAN, eventos de botão/eixo, nuvem de pontos LiDAR)
-- **Browser ↔ Servidor**: REST API para configuração, Bluetooth, CAN e LiDAR
+- **Browser ↔ Servidor**: Socket.IO para eventos em tempo real (status do gamepad, status CAN, eventos de botão/eixo, status GPS, pontos de trajeto, nuvem de pontos LiDAR)
+- **Browser ↔ Servidor**: REST API para configuração, Bluetooth, CAN, LiDAR, GPS e controle de trajeto
 - **Servidor ↔ CAN bus**: socket `PF_CAN` raw, quadros CAN estendidos (29-bit ID)
 - **Servidor ↔ Bluetooth**: `subprocess.Popen` com `bluetoothctl` em modo interativo (stdin/stdout)
 - **Servidor ↔ LiDAR**: `pyserial` na porta `/dev/ttyUSB0` a 230400 baud
+- **Servidor ↔ Modem A76XX**: `pyserial` na porta `/dev/ttyUSB1` a 115200 baud (AT commands + streaming GPS)
 
 ### Formato do quadro CAN
 

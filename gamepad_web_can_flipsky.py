@@ -66,6 +66,11 @@ DEFAULT_CONFIG = {
         "min_distance": 150,
         "max_distance": 12000,
         "emit_interval": 0.08
+    },
+    "gps": {
+        "at_port": "/dev/ttyUSB1",
+        "at_baudrate": 115200,
+        "emit_interval": 1.0
     }
 }
 
@@ -183,6 +188,165 @@ lidar_state: Dict[str, Any] = {
     "serial_available": SERIAL_AVAILABLE,
     "serial_import_error": SERIAL_IMPORT_ERROR
 }
+
+
+gps_lock = threading.Lock()
+gps_restart_event = threading.Event()
+
+gps_state: Dict[str, Any] = {
+    "connected": False,
+    "gps_powered": False,
+    "fix": 0,
+    "latitude": None,
+    "longitude": None,
+    "altitude": None,
+    "speed_kmh": None,
+    "heading": None,
+    "hdop": None,
+    "satellites_used": 0,
+    "satellites_in_view": 0,
+    "satellites": [],
+    "utc_time": None,
+    "error": None,
+    "serial_available": SERIAL_AVAILABLE,
+    "serial_import_error": SERIAL_IMPORT_ERROR,
+    "at_port": "/dev/ttyUSB1",
+    "emit_interval": 1.0,
+    "last_emit": 0.0
+}
+
+trajectory_state: Dict[str, Any] = {
+    "recording": False,
+    "paused": False,
+    "point_count": 0,
+    "start_time": None,
+    "points": []
+}
+
+gps_log_lines: List[Dict[str, Any]] = []
+MAX_GPS_LOG = 50
+
+trajectory_lock = threading.Lock()
+
+
+def _gps_log(level: str, message: str) -> None:
+    entry = {
+        "time": time.strftime("%H:%M:%S"),
+        "level": level,
+        "message": message
+    }
+    gps_log_lines.append(entry)
+    if len(gps_log_lines) > MAX_GPS_LOG:
+        gps_log_lines.pop(0)
+    socketio.emit("gps_log", entry)
+
+
+def parse_cgnssinfo(line: str) -> Optional[Dict[str, Any]]:
+    prefix = "+CGNSSINFO:"
+    idx = line.find(prefix)
+    if idx == -1:
+        return None
+    data = line[idx + len(prefix):].strip()
+    if not data:
+        return None
+    parts = data.split(",")
+    if len(parts) < 13:
+        return None
+    try:
+        fix = int(parts[0]) if parts[0].strip() else 0
+    except ValueError:
+        fix = 0
+    try:
+        gps_sats = int(parts[1]) if parts[1].strip() else 0
+    except ValueError:
+        gps_sats = 0
+    try:
+        glo_sats = int(parts[2]) if parts[2].strip() else 0
+    except ValueError:
+        glo_sats = 0
+    try:
+        bd_sats = int(parts[3]) if parts[3].strip() else 0
+    except ValueError:
+        bd_sats = 0
+    try:
+        ga_sats = int(parts[4]) if parts[4].strip() else 0
+    except ValueError:
+        ga_sats = 0
+    lat_val: Optional[float] = None
+    lng_val: Optional[float] = None
+    lat_raw = parts[5].strip()
+    ns = parts[6].strip() if len(parts) > 6 else ""
+    lng_raw = parts[7].strip() if len(parts) > 7 else ""
+    ew = parts[8].strip() if len(parts) > 8 else ""
+    if lat_raw:
+        try:
+            lat_val = float(lat_raw)
+            if ns == "S":
+                lat_val = -lat_val
+        except ValueError:
+            lat_val = None
+    if lng_raw:
+        try:
+            lng_val = float(lng_raw)
+            if ew == "W":
+                lng_val = -lng_val
+        except ValueError:
+            lng_val = None
+    utc_time = parts[10].strip() if len(parts) > 10 and parts[10].strip() else None
+    alt = None
+    if len(parts) > 11 and parts[11].strip():
+        try:
+            alt = float(parts[11])
+        except ValueError:
+            alt = None
+    speed_kmh = None
+    if len(parts) > 12 and parts[12].strip():
+        try:
+            speed_kmh = float(parts[12])
+        except ValueError:
+            speed_kmh = None
+    heading = None
+    if len(parts) > 13 and parts[13].strip():
+        try:
+            heading = float(parts[13])
+        except ValueError:
+            heading = None
+    hdop = None
+    if len(parts) > 15 and parts[15].strip():
+        try:
+            hdop = float(parts[15])
+        except ValueError:
+            hdop = None
+    sats_used = 0
+    if len(parts) > 18 and parts[18].strip():
+        try:
+            sats_used = int(parts[18])
+        except ValueError:
+            sats_used = 0
+    sats_view = gps_sats + glo_sats + bd_sats + ga_sats
+    satellites = []
+    if gps_sats > 0:
+        satellites.append({"prn": 0, "system": "GPS", "count": gps_sats})
+    if glo_sats > 0:
+        satellites.append({"prn": 0, "system": "GLONASS", "count": glo_sats})
+    if bd_sats > 0:
+        satellites.append({"prn": 0, "system": "BeiDou", "count": bd_sats})
+    if ga_sats > 0:
+        satellites.append({"prn": 0, "system": "Galileo", "count": ga_sats})
+    satellites.sort(key=lambda s: s["count"], reverse=True)
+    return {
+        "fix": fix,
+        "latitude": lat_val,
+        "longitude": lng_val,
+        "altitude": alt,
+        "speed_kmh": speed_kmh,
+        "heading": heading,
+        "hdop": hdop,
+        "satellites_used": sats_used or sats_view,
+        "satellites_in_view": sats_view,
+        "satellites": satellites,
+        "utc_time": utc_time
+    }
 
 
 
@@ -874,7 +1038,147 @@ HTML_PAGE = r"""
             border-radius: 999px;
             display: inline-block;
         }
+
+        .gps-metrics-row {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 8px;
+            margin-top: 8px;
+        }
+
+        .gps-metric {
+            background: #020617;
+            border: 1px solid #334155;
+            border-radius: 10px;
+            padding: 8px;
+        }
+
+        .gps-metric strong {
+            display: block;
+            font-size: 16px;
+        }
+
+        .gps-metric span {
+            color: #94a3b8;
+            font-size: 11px;
+        }
+
+        .gps-metric-row-2 {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 8px;
+            margin-top: 8px;
+        }
+
+        .gps-sats-canvas-wrapper {
+            position: relative;
+            display: inline-block;
+            margin-top: 8px;
+        }
+
+        #gpsSatsCanvas {
+            background: #020617;
+            border: 1px solid #475569;
+            border-radius: 14px;
+            display: block;
+        }
+
+        .gps-sats-legend {
+            display: flex;
+            justify-content: center;
+            gap: 16px;
+            margin-top: 4px;
+            font-size: 11px;
+            color: #94a3b8;
+        }
+
+        .gps-sats-legend-item {
+            display: flex;
+            align-items: center;
+            gap: 4px;
+        }
+
+        .gps-sats-legend-dot {
+            width: 9px;
+            height: 9px;
+            border-radius: 999px;
+            display: inline-block;
+        }
+
+        #gpsMap {
+            height: 350px;
+            border-radius: 10px;
+            border: 1px solid #475569;
+            margin-top: 8px;
+            z-index: 1;
+        }
+
+        .gps-fix-badge {
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 10px;
+            font-size: 11px;
+            font-weight: bold;
+        }
+
+        .gps-fix-none { background: #b91c1c; color: #fff; }
+        .gps-fix-2d { background: #a16207; color: #fff; }
+        .gps-fix-3d { background: #15803d; color: #fff; }
+
+        .gps-coords {
+            font-family: monospace;
+            font-size: 14px;
+            margin: 6px 0;
+            word-break: break-all;
+        }
+
+        .gps-controls-row {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 6px;
+            margin-top: 10px;
+        }
+
+        .gps-controls-row button {
+            padding: 8px 4px;
+            font-size: 12px;
+            margin-top: 0;
+        }
+
+        .gps-config-row {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 8px;
+            margin-top: 10px;
+        }
+
+        .gps-config-row input {
+            margin-top: 4px;
+            padding: 6px;
+            font-size: 13px;
+        }
+
+        .gps-log {
+            height: 150px;
+            overflow-y: auto;
+            background: #020617;
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            padding: 8px;
+            font-family: monospace;
+            font-size: 12px;
+            margin-top: 8px;
+        }
+
+        .gps-log-line {
+            margin-bottom: 3px;
+        }
+
+        .gps-log-info { color: #94a3b8; }
+        .gps-log-warn { color: #eab308; }
+        .gps-log-error { color: #ef4444; }
     </style>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
 </head>
 
 <body>
@@ -1154,6 +1458,90 @@ HTML_PAGE = r"""
         </div>
 
         <div class="card">
+            <h2>GPS A76XX + Trajeto</h2>
+
+            <div class="gps-metrics-row">
+                <div class="gps-metric">
+                    <strong id="gpsStatus">OFF</strong>
+                    <span>Conexao</span>
+                </div>
+                <div class="gps-metric">
+                    <strong><span id="gpsFixBadge" class="gps-fix-badge gps-fix-none">NONE</span></strong>
+                    <span>Fix</span>
+                </div>
+                <div class="gps-metric">
+                    <strong id="gpsSats">0/0</strong>
+                    <span>Satelites Us./Vis.</span>
+                </div>
+                <div class="gps-metric">
+                    <strong id="gpsHdop">-</strong>
+                    <span>HDOP</span>
+                </div>
+            </div>
+
+            <div class="gps-coords">
+                <div>Lat: <span id="gpsLat">-</span> &nbsp; Lng: <span id="gpsLng">-</span></div>
+                <div style="margin-top:4px;">Alt: <span id="gpsAlt">-</span> &nbsp; Vel: <span id="gpsSpeed">-</span> km/h &nbsp; Rumo: <span id="gpsHeading">-</span>&deg;</div>
+            </div>
+
+            <div class="gps-metric-row-2">
+                <div>
+                    <div class="gps-sats-canvas-wrapper">
+                        <canvas id="gpsSatsCanvas" width="200" height="200"></canvas>
+                    </div>
+                    <div class="gps-sats-legend">
+                        <div class="gps-sats-legend-item"><span class="gps-sats-legend-dot" style="background:#ef4444;"></span> SNR &lt; 20</div>
+                        <div class="gps-sats-legend-item"><span class="gps-sats-legend-dot" style="background:#eab308;"></span> SNR &lt; 30</div>
+                        <div class="gps-sats-legend-item"><span class="gps-sats-legend-dot" style="background:#22c55e;"></span> SNR &ge; 30</div>
+                    </div>
+                </div>
+                <div class="gps-metric" style="display:flex;flex-direction:column;align-items:center;justify-content:center;">
+                    <div style="text-align:center;">
+                        <strong id="gpsUtcTime">--:--:--</strong>
+                        <span>UTC</span>
+                    </div>
+                    <div style="text-align:center;margin-top:6px;">
+                        <strong id="gpsTrajectoryPoints">0</strong>
+                        <span>Pontos trajeto</span>
+                    </div>
+                </div>
+            </div>
+
+            <div id="gpsMap"></div>
+            <label style="margin-top:6px;font-size:12px;"><input type="checkbox" id="gpsAutoCenter" checked onchange="gpsToggleAutoCenter()"> Seguir posicao (auto-center)</label>
+
+            <div class="gps-controls-row">
+                <button class="button-green" onclick="gpsTrajectoryStart()" id="btnGpsStart">&#9654; Iniciar</button>
+                <button class="button-yellow" onclick="gpsTrajectoryPause()" id="btnGpsPause" disabled>&#9208; Pausar</button>
+                <button class="button-secondary" onclick="gpsTrajectoryResume()" id="btnGpsResume" disabled>&#9654; Retomar</button>
+                <button class="button-danger" onclick="gpsTrajectoryStop()" id="btnGpsStop" disabled>&#9209; Parar</button>
+            </div>
+
+            <div class="row" style="margin-top:6px;">
+                <button onclick="gpsDownloadJSON()">&#11015; Baixar JSON</button>
+                <button class="button-secondary" onclick="gpsTogglePower()" id="btnGpsPower">&#9889; Ligar GPS</button>
+            </div>
+
+            <div class="gps-config-row" style="margin-top:6px;">
+                <div>
+                    <label style="font-size:11px;margin-top:4px;">Porta AT</label>
+                    <input id="gpsAtPort" placeholder="/dev/ttyUSB1" value="/dev/ttyUSB1">
+                </div>
+                <div style="display:flex;align-items:flex-end;gap:4px;">
+                    <button onclick="gpsLoadConfig()" style="margin-top:4px;padding:6px 4px;font-size:11px;">Carregar</button>
+                    <button onclick="gpsSaveConfig()" class="button-secondary" style="margin-top:4px;padding:6px 4px;font-size:11px;">Salvar</button>
+                </div>
+            </div>
+
+            <h3 style="margin-top:12px;font-size:14px;">Log GPS</h3>
+            <div id="gpsLog" class="gps-log">
+                <div class="gps-log-line gps-log-info">Aguardando dados...</div>
+            </div>
+
+            <p class="muted" id="gpsError" style="margin-top:6px;font-size:12px;"></p>
+        </div>
+
+        <div class="card">
             <h2>Controle visual</h2>
 
             <div class="gamepad-panel">
@@ -1290,6 +1678,7 @@ HTML_PAGE = r"""
     </section>
 </main>
 
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
 
 <script>
@@ -2425,6 +2814,351 @@ HTML_PAGE = r"""
             ctx.fill();
         }
     }
+
+
+    let gpsMap = null;
+    let gpsMarker = null;
+    let gpsTrajectoryLine = null;
+    let gpsTrajectoryCoords = [];
+    let gpsAutoCenter = true;
+    let gpsSatellites = [];
+    let gpsPowered = false;
+    let gpsConnected = false;
+    let gpsLastFix = 0;
+
+    function gpsInitMap() {
+        if (gpsMap) return;
+        const mapEl = byId("gpsMap");
+        if (!mapEl) return;
+        gpsMap = L.map("gpsMap", { attributionControl: false, zoomControl: true }).setView([-23.55, -46.63], 15);
+        L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+            maxZoom: 19
+        }).addTo(gpsMap);
+        gpsTrajectoryLine = L.polyline([], { color: "#22c55e", weight: 3, opacity: 0.8 }).addTo(gpsMap);
+    }
+
+    function gpsToggleAutoCenter() {
+        gpsAutoCenter = byId("gpsAutoCenter").checked;
+    }
+
+    function gpsUpdateMap(lat, lng) {
+        if (!gpsMap) gpsInitMap();
+        if (!gpsMap) return;
+        const latlng = L.latLng(lat, lng);
+        if (!gpsMarker) {
+            const icon = L.divIcon({
+                className: "",
+                html: '<div style="width:14px;height:14px;background:#2563eb;border:2px solid #fff;border-radius:50%;box-shadow:0 0 8px rgba(37,99,235,0.8);"></div>',
+                iconSize: [14, 14],
+                iconAnchor: [7, 7]
+            });
+            gpsMarker = L.marker(latlng, { icon: icon }).addTo(gpsMap);
+        } else {
+            gpsMarker.setLatLng(latlng);
+        }
+        if (gpsAutoCenter) {
+            gpsMap.panTo(latlng, { animate: true, duration: 0.5 });
+        }
+    }
+
+    function gpsAddTrajectoryPoint(lat, lng) {
+        if (!gpsMap) gpsInitMap();
+        if (!gpsMap) return;
+        const ll = L.latLng(lat, lng);
+        gpsTrajectoryCoords.push(ll);
+        if (gpsTrajectoryLine) {
+            gpsTrajectoryLine.setLatLngs(gpsTrajectoryCoords);
+        }
+    }
+
+    function gpsLoadTrajectoryOnMap(points) {
+        if (!gpsMap) gpsInitMap();
+        if (!gpsMap) return;
+        gpsTrajectoryCoords = [];
+        for (const pt of points) {
+            if (pt.lat != null && pt.lng != null) {
+                gpsTrajectoryCoords.push(L.latLng(pt.lat, pt.lng));
+            }
+        }
+        if (gpsTrajectoryLine) {
+            gpsTrajectoryLine.setLatLngs(gpsTrajectoryCoords);
+        }
+        if (gpsTrajectoryCoords.length > 0) {
+            gpsMap.fitBounds(gpsTrajectoryLine.getBounds().pad(0.1));
+        }
+    }
+
+    function drawGpsSatellites() {
+        const canvas = byId("gpsSatsCanvas");
+        if (!canvas) return;
+        const ctx = canvas.getContext("2d");
+        const w = canvas.width;
+        const h = canvas.height;
+        const cx = w / 2;
+        const cy = h / 2;
+        ctx.clearRect(0, 0, w, h);
+
+        for (let r = 30; r <= 90; r += 30) {
+            ctx.beginPath();
+            ctx.arc(cx, cy, r, 0, Math.PI * 2);
+            ctx.strokeStyle = "rgba(71,85,105,0.2)";
+            ctx.lineWidth = 1;
+            ctx.stroke();
+        }
+
+        ctx.beginPath();
+        ctx.arc(cx, cy, 90, 0, Math.PI * 2);
+        ctx.strokeStyle = "#475569";
+        ctx.lineWidth = 1;
+        ctx.stroke();
+
+        ctx.beginPath();
+        ctx.moveTo(cx, cy - 93);
+        ctx.lineTo(cx, cy + 93);
+        ctx.strokeStyle = "rgba(71,85,105,0.15)";
+        ctx.stroke();
+        ctx.beginPath();
+        ctx.moveTo(cx - 93, cy);
+        ctx.lineTo(cx + 93, cy);
+        ctx.stroke();
+
+        ctx.fillStyle = "#64748b";
+        ctx.font = "10px monospace";
+        ctx.fillText("N", cx - 6, cy - 78);
+        ctx.fillText("S", cx - 6, cy + 84);
+        ctx.fillText("E", cx + 76, cy + 4);
+        ctx.fillText("W", cx - 84, cy + 4);
+
+        for (const sat of gpsSatellites) {
+            const el = sat.elevation != null ? sat.elevation : 0;
+            const az = sat.azimuth != null ? sat.azimuth : 0;
+            const snr = sat.snr != null ? sat.snr : 0;
+            const r = 90 * (1 - el / 90);
+            const angleRad = ((az - 90) * Math.PI) / 180;
+            const px = cx + r * Math.cos(angleRad);
+            const py = cy + r * Math.sin(angleRad);
+
+            let color;
+            if (snr < 20) color = "#ef4444";
+            else if (snr < 30) color = "#eab308";
+            else color = "#22c55e";
+
+            ctx.fillStyle = color;
+            ctx.beginPath();
+            ctx.arc(px, py, 3.5, 0, Math.PI * 2);
+            ctx.fill();
+
+            ctx.fillStyle = "#fff";
+            ctx.font = "8px monospace";
+            ctx.fillText(sat.prn, px + 5, py - 4);
+        }
+    }
+
+    function gpsLogLine(entry) {
+        const logDiv = byId("gpsLog");
+        if (!logDiv) return;
+        const line = document.createElement("div");
+        line.className = "gps-log-line gps-log-" + (entry.level || "info");
+        line.textContent = "[" + (entry.time || "") + "] " + (entry.message || "");
+        logDiv.appendChild(line);
+        logDiv.scrollTop = logDiv.scrollHeight;
+        while (logDiv.children.length > 100) {
+            logDiv.removeChild(logDiv.firstChild);
+        }
+    }
+
+    socket.on("gps_status", data => {
+        if (!data) return;
+        gpsConnected = data.connected || false;
+        gpsPowered = data.gps_powered || false;
+
+        const statusEl = byId("gpsStatus");
+        if (gpsConnected) {
+            statusEl.textContent = "ON";
+            statusEl.className = "status-ok";
+        } else {
+            statusEl.textContent = "OFF";
+            statusEl.className = "status-off";
+        }
+
+        const fix = data.fix || 0;
+        gpsLastFix = fix;
+        const badge = byId("gpsFixBadge");
+        if (fix >= 2) { badge.textContent = "3D"; badge.className = "gps-fix-badge gps-fix-3d"; }
+        else if (fix === 1) { badge.textContent = "2D"; badge.className = "gps-fix-badge gps-fix-2d"; }
+        else { badge.textContent = "NONE"; badge.className = "gps-fix-badge gps-fix-none"; }
+
+        byId("gpsSats").textContent = (data.satellites_used || 0) + "/" + (data.satellites_in_view || 0);
+        byId("gpsHdop").textContent = data.hdop != null ? Number(data.hdop).toFixed(1) : "-";
+
+        if (data.latitude != null) byId("gpsLat").textContent = Number(data.latitude).toFixed(7);
+        if (data.longitude != null) byId("gpsLng").textContent = Number(data.longitude).toFixed(7);
+        if (data.altitude != null) byId("gpsAlt").textContent = Number(data.altitude).toFixed(1) + "m";
+        else byId("gpsAlt").textContent = "-";
+
+        byId("gpsSpeed").textContent = data.speed_kmh != null ? Number(data.speed_kmh).toFixed(1) : "-";
+        byId("gpsHeading").textContent = data.heading != null ? Math.round(Number(data.heading)) : "-";
+        if (data.utc_time) {
+            const t = String(data.utc_time).replace(/\.\d+$/, "");
+            if (t.length >= 6) byId("gpsUtcTime").textContent = t.slice(0,2) + ":" + t.slice(2,4) + ":" + t.slice(4,6);
+            else byId("gpsUtcTime").textContent = t;
+        } else {
+            byId("gpsUtcTime").textContent = "--:--:--";
+        }
+
+        if (data.satellites && data.satellites.length > 0) {
+            gpsSatellites = data.satellites;
+        } else if (data.satellites_in_view === 0) {
+            gpsSatellites = [];
+        }
+        drawGpsSatellites();
+
+        if (data.latitude != null && data.longitude != null && data.latitude !== 0 && data.longitude !== 0) {
+            gpsInitMap();
+            gpsUpdateMap(data.latitude, data.longitude);
+        }
+
+        if (data.error) {
+            byId("gpsError").textContent = data.error;
+        } else {
+            byId("gpsError").textContent = "";
+        }
+
+        const btnPwr = byId("btnGpsPower");
+        if (gpsPowered) {
+            btnPwr.textContent = "⚡ Desligar GPS";
+            btnPwr.className = "button-danger";
+        } else {
+            btnPwr.textContent = "⚡ Ligar GPS";
+            btnPwr.className = "button-secondary";
+        }
+    });
+
+    socket.on("gps_trajectory_status", data => {
+        if (!data) return;
+        byId("gpsTrajectoryPoints").textContent = data.point_count || 0;
+
+        const recording = data.recording || false;
+        const paused = data.paused || false;
+
+        byId("btnGpsStart").disabled = recording;
+        byId("btnGpsPause").disabled = !recording || paused;
+        byId("btnGpsResume").disabled = !recording || !paused;
+        byId("btnGpsStop").disabled = !recording;
+
+        if (recording && paused) {
+            byId("gpsTrajectoryPoints").textContent = (data.point_count || 0) + " PAUSADO";
+        }
+    });
+
+    socket.on("gps_trajectory_point", point => {
+        if (!point || point.lat == null || point.lng == null) return;
+        gpsAddTrajectoryPoint(point.lat, point.lng);
+    });
+
+    socket.on("gps_log", gpsLogLine);
+
+    async function gpsLoadConfig() {
+        try {
+            const resp = await fetch("/api/gps/config");
+            const cfg = await resp.json();
+            byId("gpsAtPort").value = cfg.at_port || "/dev/ttyUSB1";
+        } catch (e) {
+            addLog("Erro ao carregar config GPS.");
+        }
+    }
+
+    async function gpsSaveConfig() {
+        const atPort = byId("gpsAtPort").value.trim() || "/dev/ttyUSB1";
+        try {
+            await fetch("/api/gps/config", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ at_port: atPort })
+            });
+            addLog("Config GPS salva. Reiniciando...");
+        } catch (e) {
+            addLog("Erro ao salvar config GPS.");
+        }
+    }
+
+    async function gpsTogglePower() {
+        try {
+            if (gpsPowered) {
+                const resp = await fetch("/api/gps/power/off", { method: "POST" });
+                const result = await resp.json();
+                addLog(result.message || result.error || "GPS desligado");
+            } else {
+                const resp = await fetch("/api/gps/power/on", { method: "POST" });
+                const result = await resp.json();
+                addLog(result.message || result.error || "GPS ligado");
+            }
+        } catch (e) {
+            addLog("Erro ao alternar GPS.");
+        }
+    }
+
+    async function gpsTrajectoryStart() {
+        try {
+            const resp = await fetch("/api/gps/trajectory/start", { method: "POST" });
+            const result = await resp.json();
+            gpsTrajectoryCoords = [];
+            if (gpsTrajectoryLine) gpsTrajectoryLine.setLatLngs([]);
+            addLog(result.message || result.error || "");
+        } catch (e) {
+            addLog("Erro ao iniciar gravacao.");
+        }
+    }
+
+    async function gpsTrajectoryPause() {
+        try {
+            const resp = await fetch("/api/gps/trajectory/pause", { method: "POST" });
+            const result = await resp.json();
+            addLog(result.message || result.error || "");
+        } catch (e) {
+            addLog("Erro ao pausar gravacao.");
+        }
+    }
+
+    async function gpsTrajectoryResume() {
+        try {
+            const resp = await fetch("/api/gps/trajectory/resume", { method: "POST" });
+            const result = await resp.json();
+            addLog(result.message || result.error || "");
+        } catch (e) {
+            addLog("Erro ao retomar gravacao.");
+        }
+    }
+
+    async function gpsTrajectoryStop() {
+        try {
+            const resp = await fetch("/api/gps/trajectory/stop", { method: "POST" });
+            const result = await resp.json();
+            addLog(result.message || result.error || "");
+        } catch (e) {
+            addLog("Erro ao finalizar gravacao.");
+        }
+    }
+
+    async function gpsDownloadJSON() {
+        try {
+            const resp = await fetch("/api/gps/trajectory/download-full");
+            const data = await resp.json();
+            const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement("a");
+            a.href = url;
+            a.download = "trajeto_gps_" + new Date().toISOString().replace(/[:.]/g, "-") + ".json";
+            a.click();
+            URL.revokeObjectURL(url);
+            addLog("Trajeto baixado: " + (data.metadata ? data.metadata.total_points : "?") + " pontos.");
+        } catch (e) {
+            addLog("Erro ao baixar JSON.");
+        }
+    }
+
+    gpsLoadConfig();
+    gpsInitMap();
 </script>
 </body>
 </html>
@@ -4293,6 +5027,651 @@ def lidar_reader_loop() -> None:
             emit_lidar_status()
 
 
+def get_gps_config() -> Dict[str, Any]:
+    config = load_config()
+    gps_config = dict(DEFAULT_CONFIG["gps"])
+    existing = config.get("gps", {})
+    if isinstance(existing, dict):
+        gps_config.update(existing)
+    gps_config["at_port"] = str(gps_config.get("at_port", "/dev/ttyUSB1")).strip() or "/dev/ttyUSB1"
+    try:
+        gps_config["at_baudrate"] = int(gps_config.get("at_baudrate", 115200))
+    except Exception:
+        gps_config["at_baudrate"] = 115200
+    try:
+        gps_config["emit_interval"] = max(0.2, min(5.0, float(gps_config.get("emit_interval", 1.0))))
+    except Exception:
+        gps_config["emit_interval"] = 1.0
+    return gps_config
+
+
+def save_gps_config(update: Dict[str, Any]) -> Dict[str, Any]:
+    config = load_config()
+    gps_config = get_gps_config()
+    allowed = set(DEFAULT_CONFIG["gps"].keys())
+    for key, value in update.items():
+        if key in allowed:
+            gps_config[key] = value
+    config["gps"] = gps_config
+    save_config(config)
+    with gps_lock:
+        gps_state["at_port"] = gps_config["at_port"]
+        gps_state["emit_interval"] = gps_config["emit_interval"]
+    gps_restart_event.set()
+    _gps_log("info", "Config GPS salva. Reiniciando leitura...")
+    return get_gps_config()
+
+
+def gps_power_on() -> Dict[str, Any]:
+    if not SERIAL_AVAILABLE:
+        return {"ok": False, "error": "pyserial nao disponivel"}
+    gps_config = get_gps_config()
+    at_port = gps_config["at_port"]
+    at_baudrate = gps_config["at_baudrate"]
+    if not os.path.exists(at_port):
+        return {"ok": False, "error": f"Porta AT {at_port} nao encontrada"}
+    try:
+        ser = serial.Serial(port=at_port, baudrate=at_baudrate, timeout=1.0)
+        ser.write(b"AT\r\n")
+        time.sleep(0.3)
+        resp = ser.read(512)
+        if b"OK" not in resp:
+            ser.close()
+            return {"ok": False, "error": "Modem nao respondeu AT na porta " + at_port}
+        ser.write(b"AT+CGNSSPWR=1\r\n")
+        time.sleep(0.5)
+        resp2 = ser.read(512)
+        ser.close()
+        if b"OK" in resp2 or b"READY" in resp2:
+            with gps_lock:
+                gps_state["gps_powered"] = True
+            _gps_log("info", "GPS ligado: AT+CGNSSPWR=1 -> OK")
+            gps_restart_event.set()
+            return {"ok": True, "message": "GPS ligado com sucesso"}
+        else:
+            _gps_log("error", f"AT+CGNSSPWR=1 falhou: {resp2.decode(errors='ignore')}")
+            return {"ok": False, "error": "Falha ao ligar GPS: " + resp2.decode(errors="ignore")}
+    except Exception as e:
+        _gps_log("error", f"Erro ao ligar GPS: {e}")
+        return {"ok": False, "error": str(e)}
+
+
+def gps_power_off() -> Dict[str, Any]:
+    if not SERIAL_AVAILABLE:
+        return {"ok": False, "error": "pyserial nao disponivel"}
+    gps_config = get_gps_config()
+    at_port = gps_config["at_port"]
+    at_baudrate = gps_config["at_baudrate"]
+    if not os.path.exists(at_port):
+        return {"ok": False, "error": f"Porta AT {at_port} nao encontrada"}
+    try:
+        ser = serial.Serial(port=at_port, baudrate=at_baudrate, timeout=1.0)
+        ser.write(b"AT+CGNSSPWR=0\r\n")
+        time.sleep(0.5)
+        resp = ser.read(512)
+        ser.close()
+        with gps_lock:
+            gps_state["gps_powered"] = False
+        _gps_log("info", "GPS desligado: AT+CGNSSPWR=0")
+        return {"ok": True, "message": "GPS desligado"}
+    except Exception as e:
+        _gps_log("error", f"Erro ao desligar GPS: {e}")
+        return {"ok": False, "error": str(e)}
+
+
+def trajectory_start() -> Dict[str, Any]:
+    with trajectory_lock:
+        if trajectory_state["recording"]:
+            return {"ok": False, "error": "Ja esta gravando"}
+        trajectory_state["recording"] = True
+        trajectory_state["paused"] = False
+        trajectory_state["point_count"] = 0
+        trajectory_state["start_time"] = time.time()
+        trajectory_state["points"] = []
+    _gps_log("info", "Gravacao de trajeto iniciada")
+    emit_gps_trajectory_status()
+    return {"ok": True, "message": "Gravacao iniciada"}
+
+
+def trajectory_pause() -> Dict[str, Any]:
+    with trajectory_lock:
+        if not trajectory_state["recording"]:
+            return {"ok": False, "error": "Nao esta gravando"}
+        if trajectory_state["paused"]:
+            return {"ok": False, "error": "Ja esta pausado"}
+        trajectory_state["paused"] = True
+    _gps_log("info", f"Gravacao pausada ({trajectory_state['point_count']} pontos)")
+    emit_gps_trajectory_status()
+    return {"ok": True, "message": f"Gravacao pausada ({trajectory_state['point_count']} pontos)"}
+
+
+def trajectory_resume() -> Dict[str, Any]:
+    with trajectory_lock:
+        if not trajectory_state["recording"]:
+            return {"ok": False, "error": "Nao esta gravando"}
+        if not trajectory_state["paused"]:
+            return {"ok": False, "error": "Nao esta pausado"}
+        trajectory_state["paused"] = False
+    _gps_log("info", "Gravacao retomada")
+    emit_gps_trajectory_status()
+    return {"ok": True, "message": "Gravacao retomada"}
+
+
+def trajectory_stop() -> Dict[str, Any]:
+    with trajectory_lock:
+        if not trajectory_state["recording"]:
+            return {"ok": False, "error": "Nao esta gravando"}
+        trajectory_state["recording"] = False
+        trajectory_state["paused"] = False
+        count = trajectory_state["point_count"]
+    _gps_log("info", f"Gravacao finalizada ({count} pontos)")
+    emit_gps_trajectory_status()
+    return {"ok": True, "message": f"Gravacao finalizada ({count} pontos)", "point_count": count}
+
+
+def trajectory_to_json() -> Dict[str, Any]:
+    with trajectory_lock:
+        points = list(trajectory_state["points"])
+        start_time = trajectory_state["start_time"]
+        count = trajectory_state["point_count"]
+    total_dist = 0.0
+    for i in range(1, len(points)):
+        lat1 = points[i - 1].get("lat")
+        lng1 = points[i - 1].get("lng")
+        lat2 = points[i].get("lat")
+        lng2 = points[i].get("lng")
+        if all(v is not None for v in [lat1, lng1, lat2, lng2]):
+            try:
+                dlat = (lat2 - lat1) * 111320.0
+                dlng = (lng2 - lng1) * 111320.0 * math.cos(math.radians((lat1 + lat2) / 2))
+                total_dist += math.sqrt(dlat * dlat + dlng * dlng)
+            except Exception:
+                pass
+    total_dist_km = round(total_dist / 1000.0, 3)
+    return {
+        "metadata": {
+            "start_time": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(start_time)) if start_time else None,
+            "end_time": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime()),
+            "total_points": count,
+            "total_distance_km": total_dist_km,
+            "device": "SIMCom A7670E-MASA"
+        },
+        "points": points
+    }
+
+
+def emit_gps_status() -> None:
+    with gps_lock:
+        payload = {
+            "connected": gps_state["connected"],
+            "gps_powered": gps_state["gps_powered"],
+            "fix": gps_state["fix"],
+            "latitude": gps_state["latitude"],
+            "longitude": gps_state["longitude"],
+            "altitude": gps_state["altitude"],
+            "speed_kmh": gps_state["speed_kmh"],
+            "heading": gps_state["heading"],
+            "hdop": gps_state["hdop"],
+            "satellites_used": gps_state["satellites_used"],
+            "satellites_in_view": gps_state["satellites_in_view"],
+            "satellites": list(gps_state["satellites"]),
+            "utc_time": gps_state["utc_time"],
+            "error": gps_state["error"],
+            "serial_available": gps_state.get("serial_available", False),
+            "serial_import_error": gps_state.get("serial_import_error", ""),
+            "at_port": gps_state["at_port"],
+            "timestamp": time.time()
+        }
+    socketio.emit("gps_status", payload)
+
+
+def emit_gps_trajectory_status() -> None:
+    with trajectory_lock:
+        payload = {
+            "recording": trajectory_state["recording"],
+            "paused": trajectory_state["paused"],
+            "point_count": trajectory_state["point_count"],
+            "start_time": trajectory_state["start_time"]
+        }
+    socketio.emit("gps_trajectory_status", payload)
+
+
+def gps_reader_loop() -> None:
+    gs = gps_state
+
+    while True:
+        gps_restart_event.clear()
+
+        if not SERIAL_AVAILABLE:
+            with gps_lock:
+                gs["connected"] = False
+                gs["gps_powered"] = False
+                gs["error"] = "Biblioteca pyserial nao disponivel. Instale com: pip install pyserial"
+                gs["serial_available"] = False
+                gs["serial_import_error"] = SERIAL_IMPORT_ERROR
+            emit_gps_status()
+            time.sleep(3)
+            continue
+
+        gps_config = get_gps_config()
+        at_port = gps_config["at_port"]
+        at_baudrate = gps_config["at_baudrate"]
+
+        with gps_lock:
+            gs["at_port"] = at_port
+            gs["emit_interval"] = gps_config["emit_interval"]
+
+        if not os.path.exists(at_port):
+            with gps_lock:
+                gs["connected"] = False
+                gs["error"] = f"Porta AT {at_port} nao encontrada"
+            emit_gps_status()
+            _gps_log("error", f"Porta AT {at_port} nao encontrada")
+            time.sleep(2)
+            continue
+
+        _gps_log("info", f"Ligando GPS via AT em {at_port}...")
+        ser = None
+        try:
+            ser = serial.Serial(port=at_port, baudrate=at_baudrate, timeout=0.3)
+
+            ser.write(b"AT\r\n")
+            time.sleep(0.3)
+            resp = ser.read(512)
+            if b"OK" not in resp:
+                ser.close()
+                with gps_lock:
+                    gs["connected"] = False
+                    gs["error"] = f"Modem nao respondeu AT em {at_port}"
+                emit_gps_status()
+                _gps_log("error", f"Modem nao respondeu AT em {at_port}")
+                time.sleep(2)
+                continue
+
+            ser.write(b"AT+CGNSSPWR=1\r\n")
+            time.sleep(0.5)
+            resp2 = ser.read(512)
+
+            if b"OK" not in resp2 and b"READY" not in resp2:
+                _gps_log("warn", f"AT+CGNSSPWR=1: {resp2.decode(errors='ignore')[:100]}")
+
+            with gps_lock:
+                gs["gps_powered"] = True
+            _gps_log("info", "GPS ligado, iniciando streaming CGNSSINFO...")
+
+            ser.write(b"AT+CGNSSINFO=1\r\n")
+            time.sleep(0.5)
+            resp3 = ser.read(512)
+            if b"OK" not in resp3:
+                _gps_log("warn", f"AT+CGNSSINFO=1: {resp3.decode(errors='ignore')[:100]}")
+
+            with gps_lock:
+                gs["connected"] = True
+                gs["error"] = None
+                gs["serial_available"] = True
+                gs["serial_import_error"] = ""
+                gs["satellites"].clear()
+
+            emit_gps_status()
+            _gps_log("info", f"Streaming GPS ativo em {at_port}. Aguardando fix...")
+
+            buffer = ""
+            last_emit = 0.0
+
+            while not gps_restart_event.is_set():
+                try:
+                    chunk = ser.read(512)
+                    if not chunk:
+                        now = time.time()
+                        gps_config = get_gps_config()
+                        emit_interval = gps_config.get("emit_interval", 1.0)
+                        if now - last_emit >= emit_interval:
+                            emit_gps_status()
+                            last_emit = now
+                        continue
+
+                    buffer += chunk.decode("ascii", errors="ignore")
+
+                    while "\n" in buffer:
+                        line_end = buffer.index("\n")
+                        line = buffer[:line_end].strip()
+                        buffer = buffer[line_end + 1:]
+
+                        if not line:
+                            continue
+
+                        if line.startswith("+CGNSSINFO:"):
+                            info = parse_cgnssinfo(line)
+                            if info is None:
+                                continue
+
+                            with gps_lock:
+                                if info.get("fix") is not None:
+                                    gs["fix"] = info["fix"]
+                                if info.get("latitude") is not None:
+                                    gs["latitude"] = info["latitude"]
+                                if info.get("longitude") is not None:
+                                    gs["longitude"] = info["longitude"]
+                                if info.get("altitude") is not None:
+                                    gs["altitude"] = info["altitude"]
+                                if info.get("speed_kmh") is not None:
+                                    gs["speed_kmh"] = info["speed_kmh"]
+                                if info.get("heading") is not None:
+                                    gs["heading"] = info["heading"]
+                                if info.get("hdop") is not None:
+                                    gs["hdop"] = info["hdop"]
+                                if info.get("satellites_used") is not None:
+                                    gs["satellites_used"] = info["satellites_used"]
+                                if info.get("satellites_in_view") is not None:
+                                    gs["satellites_in_view"] = info["satellites_in_view"]
+                                if info.get("satellites"):
+                                    gs["satellites"] = info["satellites"]
+                                if info.get("utc_time"):
+                                    gs["utc_time"] = info["utc_time"]
+
+                            now = time.time()
+                            gps_config = get_gps_config()
+                            emit_interval = gps_config.get("emit_interval", 1.0)
+
+                            if now - last_emit >= emit_interval:
+                                with gps_lock:
+                                    lat = gs["latitude"]
+                                    lng = gs["longitude"]
+                                    fix = gs["fix"]
+                                    alt = gs["altitude"]
+                                    spd = gs["speed_kmh"]
+                                    hdg = gs["heading"]
+                                    utc = gs["utc_time"]
+                                emit_gps_status()
+                                last_emit = now
+
+                                with trajectory_lock:
+                                    recording = trajectory_state["recording"]
+                                    paused = trajectory_state["paused"]
+
+                                if recording and not paused and fix > 0 and lat is not None and lng is not None:
+                                    point = {
+                                        "lat": lat,
+                                        "lng": lng,
+                                        "alt": alt,
+                                        "speed_kmh": spd,
+                                        "heading": hdg,
+                                        "utc_time": utc,
+                                        "epoch": time.time()
+                                    }
+                                    with trajectory_lock:
+                                        if trajectory_state["recording"] and not trajectory_state["paused"]:
+                                            point["index"] = trajectory_state["point_count"]
+                                            trajectory_state["points"].append(point)
+                                            trajectory_state["point_count"] = len(trajectory_state["points"])
+                                            socketio.emit("gps_trajectory_point", point)
+
+                except serial.SerialException as e:
+                    _gps_log("error", f"Erro serial: {e}")
+                    with gps_lock:
+                        gs["connected"] = False
+                        gs["error"] = f"Erro serial: {e}"
+                    emit_gps_status()
+                    break
+
+                except Exception as e:
+                    _gps_log("error", str(e))
+                    with gps_lock:
+                        gs["error"] = str(e)
+                    emit_gps_status()
+
+        except serial.SerialException as e:
+            _gps_log("error", f"Nao foi possivel abrir {at_port}: {e}")
+            with gps_lock:
+                gs["connected"] = False
+                gs["error"] = f"Nao foi possivel abrir {at_port}: {e}"
+            emit_gps_status()
+            time.sleep(3)
+
+        except PermissionError as e:
+            _gps_log("error", f"Sem permissao para {at_port}: {e}")
+            with gps_lock:
+                gs["connected"] = False
+                gs["error"] = f"Sem permissao: {e}"
+            emit_gps_status()
+            time.sleep(5)
+
+        except Exception as e:
+            _gps_log("error", str(e))
+            with gps_lock:
+                gs["connected"] = False
+                gs["error"] = str(e)
+            emit_gps_status()
+            time.sleep(3)
+
+        finally:
+            if ser is not None and ser.is_open:
+                try:
+                    ser.write(b"AT+CGNSSINFO=0\r\n")
+                    time.sleep(0.2)
+                    ser.read(256)
+                except Exception:
+                    pass
+                try:
+                    ser.close()
+                except Exception:
+                    pass
+            with gps_lock:
+                gs["connected"] = False
+                gs["satellites"].clear()
+                gs["satellites_in_view"] = 0
+            emit_gps_status()
+
+
+@app.route("/api/gps/config", methods=["GET"])
+def api_gps_get_config():
+    return jsonify(get_gps_config())
+
+
+@app.route("/api/gps/config", methods=["POST"])
+def api_gps_set_config():
+    data = request.get_json(force=True, silent=True)
+    if not isinstance(data, dict):
+        data = {}
+    return jsonify(save_gps_config(data))
+
+
+@app.route("/api/gps/status", methods=["GET"])
+def api_gps_get_status():
+    with gps_lock:
+        gps_payload = {
+            "connected": gps_state["connected"],
+            "gps_powered": gps_state["gps_powered"],
+            "fix": gps_state["fix"],
+            "latitude": gps_state["latitude"],
+            "longitude": gps_state["longitude"],
+            "altitude": gps_state["altitude"],
+            "speed_kmh": gps_state["speed_kmh"],
+            "heading": gps_state["heading"],
+            "hdop": gps_state["hdop"],
+            "satellites_used": gps_state["satellites_used"],
+            "satellites_in_view": gps_state["satellites_in_view"],
+            "satellites": list(gps_state["satellites"]),
+            "utc_time": gps_state["utc_time"],
+            "error": gps_state["error"],
+            "at_port": gps_state["at_port"]
+        }
+    with trajectory_lock:
+        traj_payload = {
+            "recording": trajectory_state["recording"],
+            "paused": trajectory_state["paused"],
+            "point_count": trajectory_state["point_count"],
+            "start_time": trajectory_state["start_time"]
+        }
+    return jsonify({"gps": gps_payload, "trajectory": traj_payload})
+
+
+@app.route("/api/gps/power/on", methods=["POST"])
+def api_gps_power_on():
+    return jsonify(gps_power_on())
+
+
+@app.route("/api/gps/power/off", methods=["POST"])
+def api_gps_power_off():
+    return jsonify(gps_power_off())
+
+
+@app.route("/api/gps/stream/start", methods=["POST"])
+def api_gps_stream_start():
+    if not SERIAL_AVAILABLE:
+        return jsonify({"ok": False, "error": "pyserial nao disponivel"})
+    gps_config = get_gps_config()
+    at_port = gps_config["at_port"]
+    at_baudrate = gps_config["at_baudrate"]
+    if not os.path.exists(at_port):
+        return jsonify({"ok": False, "error": f"Porta {at_port} nao encontrada"})
+    try:
+        ser = serial.Serial(port=at_port, baudrate=at_baudrate, timeout=1.0)
+        ser.write(b"AT+CGNSSINFO=1\r\n")
+        time.sleep(0.5)
+        resp = ser.read(512)
+        ser.close()
+        if b"OK" in resp:
+            _gps_log("info", "Stream CGNSSINFO iniciado")
+            gps_restart_event.set()
+            return jsonify({"ok": True, "message": "Stream iniciado"})
+        return jsonify({"ok": False, "error": "Resposta: " + resp.decode(errors="ignore")[:100]})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)})
+
+
+@app.route("/api/gps/stream/stop", methods=["POST"])
+def api_gps_stream_stop():
+    if not SERIAL_AVAILABLE:
+        return jsonify({"ok": False, "error": "pyserial nao disponivel"})
+    gps_config = get_gps_config()
+    at_port = gps_config["at_port"]
+    at_baudrate = gps_config["at_baudrate"]
+    if not os.path.exists(at_port):
+        return jsonify({"ok": False, "error": f"Porta {at_port} nao encontrada"})
+    try:
+        ser = serial.Serial(port=at_port, baudrate=at_baudrate, timeout=1.0)
+        ser.write(b"AT+CGNSSINFO=0\r\n")
+        time.sleep(0.5)
+        resp = ser.read(512)
+        ser.close()
+        _gps_log("info", "Stream CGNSSINFO parado")
+        gps_restart_event.set()
+        return jsonify({"ok": True, "message": "Stream parado"})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)})
+
+
+@app.route("/api/gps/poll", methods=["POST"])
+def api_gps_poll_once():
+    if not SERIAL_AVAILABLE:
+        return jsonify({"ok": False, "error": "pyserial nao disponivel"})
+    gps_config = get_gps_config()
+    at_port = gps_config["at_port"]
+    at_baudrate = gps_config["at_baudrate"]
+    if not os.path.exists(at_port):
+        return jsonify({"ok": False, "error": f"Porta {at_port} nao encontrada"})
+    try:
+        ser = serial.Serial(port=at_port, baudrate=at_baudrate, timeout=1.0)
+        ser.write(b"AT+CGNSSINFO\r\n")
+        time.sleep(0.5)
+        resp = ser.read(512)
+        ser.close()
+        text = resp.decode(errors="ignore")
+        for line in text.split("\n"):
+            line = line.strip()
+            if line.startswith("+CGNSSINFO:"):
+                info = parse_cgnssinfo(line)
+                if info:
+                    _gps_log("info", f"Poll: fix={info.get('fix')}, sats={info.get('satellites_used')}")
+                    return jsonify({"ok": True, "data": info})
+        return jsonify({"ok": False, "error": "Nenhum CGNSSINFO recebido"})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)})
+
+
+@app.route("/api/gps/coldboot", methods=["POST"])
+def api_gps_cold_boot():
+    if not SERIAL_AVAILABLE:
+        return jsonify({"ok": False, "error": "pyserial nao disponivel"})
+    gps_config = get_gps_config()
+    at_port = gps_config["at_port"]
+    at_baudrate = gps_config["at_baudrate"]
+    if not os.path.exists(at_port):
+        return jsonify({"ok": False, "error": f"Porta {at_port} nao encontrada"})
+    try:
+        ser = serial.Serial(port=at_port, baudrate=at_baudrate, timeout=1.0)
+        ser.write(b"AT+CGNSSCOLD\r\n")
+        time.sleep(0.5)
+        resp = ser.read(512)
+        ser.close()
+        _gps_log("info", "Cold boot GPS executado")
+        gps_restart_event.set()
+        return jsonify({"ok": True, "message": "Cold boot executado. Aguardando reaquisicao..."})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)})
+
+
+@app.route("/api/gps/hotboot", methods=["POST"])
+def api_gps_hot_boot():
+    if not SERIAL_AVAILABLE:
+        return jsonify({"ok": False, "error": "pyserial nao disponivel"})
+    gps_config = get_gps_config()
+    at_port = gps_config["at_port"]
+    at_baudrate = gps_config["at_baudrate"]
+    if not os.path.exists(at_port):
+        return jsonify({"ok": False, "error": f"Porta {at_port} nao encontrada"})
+    try:
+        ser = serial.Serial(port=at_port, baudrate=at_baudrate, timeout=1.0)
+        ser.write(b"AT+CGNSSHOT\r\n")
+        time.sleep(0.5)
+        resp = ser.read(512)
+        ser.close()
+        _gps_log("info", "Hot boot GPS executado")
+        gps_restart_event.set()
+        return jsonify({"ok": True, "message": "Hot boot executado"})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)})
+
+
+@app.route("/api/gps/trajectory/start", methods=["POST"])
+def api_trajectory_start():
+    return jsonify(trajectory_start())
+
+
+@app.route("/api/gps/trajectory/pause", methods=["POST"])
+def api_trajectory_pause():
+    return jsonify(trajectory_pause())
+
+
+@app.route("/api/gps/trajectory/resume", methods=["POST"])
+def api_trajectory_resume():
+    return jsonify(trajectory_resume())
+
+
+@app.route("/api/gps/trajectory/stop", methods=["POST"])
+def api_trajectory_stop():
+    return jsonify(trajectory_stop())
+
+
+@app.route("/api/gps/trajectory/download", methods=["GET"])
+def api_trajectory_download():
+    data = trajectory_to_json()
+    data.pop("points", None)
+    return jsonify(data)
+
+
+@app.route("/api/gps/trajectory/download-full", methods=["GET"])
+def api_trajectory_download_full():
+    data = trajectory_to_json()
+    return jsonify(data)
+
+
+@app.route("/api/gps/log", methods=["GET"])
+def api_gps_log():
+    return jsonify(list(gps_log_lines))
+
+
 @app.route("/")
 def index():
     return render_template_string(HTML_PAGE)
@@ -4571,6 +5950,10 @@ def api_lidar_get_status():
 @socketio.on("connect")
 def socket_connect():
     emit_status()
+    emit_gps_status()
+    emit_gps_trajectory_status()
+    for entry in gps_log_lines:
+        socketio.emit("gps_log", entry)
 
 
 def print_startup_message() -> None:
@@ -4626,6 +6009,12 @@ if __name__ == "__main__":
         daemon=True
     )
     lidar_thread.start()
+
+    gps_thread = threading.Thread(
+        target=gps_reader_loop,
+        daemon=True
+    )
+    gps_thread.start()
 
     socketio.run(
         app,
