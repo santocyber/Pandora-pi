@@ -4,6 +4,8 @@ Aplicação web que transforma um Raspberry Pi em uma central de controle para r
 
 Todo o sistema roda como um único script Python — Flask + Socket.IO no backend, HTML/CSS/JS inline no frontend, leitura de gamepad via `evdev`, envio de quadros CAN raw via SocketCAN e leitura serial do LiDAR via `pyserial`.
 
+![Interface PandoraPi](assets/screenshot.png)
+
 ## Hardware necessário
 
 | Componente | Detalhes |
