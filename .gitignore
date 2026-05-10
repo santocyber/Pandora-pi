@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+*.pyo
+gamepad_config.json
+*.log
+.env
