@@ -9,6 +9,7 @@ import subprocess
 import socket
 import struct
 import glob
+import xml.etree.ElementTree as ET
 from typing import Any, Dict, List, Optional
 
 from flask import Flask, request, jsonify, render_template_string
@@ -34,6 +35,17 @@ except Exception as import_error:
     SERIAL_AVAILABLE = False
     SERIAL_IMPORT_ERROR = str(import_error)
 
+try:
+    from ob_depth import DepthCamera
+    DEPTH_AVAILABLE = True
+    DEPTH_IMPORT_ERROR = ""
+except Exception as depth_import_error:
+    DepthCamera = None
+    DEPTH_AVAILABLE = False
+    DEPTH_IMPORT_ERROR = str(depth_import_error)
+
+import base64
+
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(APP_DIR, "gamepad_config.json")
@@ -58,7 +70,9 @@ DEFAULT_CONFIG = {
         "invert_left": False,
         "invert_right": True,
         "require_deadman": True,
-        "deadman_button": "BTN_TR"
+        "deadman_button": "BTN_TR",
+        "brake_button": "BTN_SOUTH",
+        "brake_current": 8.0
     },
     "lidar": {
         "port": "/dev/ttyUSB0",
@@ -71,6 +85,12 @@ DEFAULT_CONFIG = {
         "at_port": "/dev/ttyUSB1",
         "at_baudrate": 115200,
         "emit_interval": 1.0
+    },
+    "depth_camera": {
+        "enabled": True,
+        "min_depth_mm": 500,
+        "max_depth_mm": 8000,
+        "emit_fps": 10
     }
 }
 
@@ -170,7 +190,8 @@ robot_state = {
     "last_send_time": 0.0,
     "last_error": None,
     "last_tx": None,
-    "deadman_ok": False
+    "deadman_ok": False,
+    "brake_active": False
 }
 
 lidar_lock = threading.Lock()
@@ -187,6 +208,21 @@ lidar_state: Dict[str, Any] = {
     "error": None,
     "serial_available": SERIAL_AVAILABLE,
     "serial_import_error": SERIAL_IMPORT_ERROR
+}
+
+depth_lock = threading.Lock()
+depth_restart_event = threading.Event()
+
+depth_state: Dict[str, Any] = {
+    "connected": False,
+    "fps": 0.0,
+    "min_depth_mm": 500,
+    "max_depth_mm": 8000,
+    "width": 640,
+    "height": 480,
+    "error": None,
+    "depth_available": DEPTH_AVAILABLE,
+    "depth_import_error": DEPTH_IMPORT_ERROR
 }
 
 
@@ -227,6 +263,44 @@ gps_log_lines: List[Dict[str, Any]] = []
 MAX_GPS_LOG = 50
 
 trajectory_lock = threading.Lock()
+
+uploaded_trajectory: Dict[str, Any] = {
+    "filename": "",
+    "points": [],
+    "point_count": 0,
+    "loaded": False
+}
+
+follow_lock = threading.Lock()
+follow_state: Dict[str, Any] = {
+    "active": False,
+    "wp_index": 0,
+    "wp_total": 0,
+    "distance": 0.0,
+    "bearing": 0.0,
+    "throttle": 0.0,
+    "steering": 0.0,
+    "error": None
+}
+
+follow_config: Dict[str, Any] = {
+    "waypoint_threshold": 2.0,
+    "max_auto_speed": 0.15,
+    "steering_kp": 0.5,
+    "avoidance_enabled": True,
+    "avoidance_weight": 0.5,
+    "safe_distance_mm": 500,
+    "critical_distance_mm": 300
+}
+
+lidar_obstacle_lock = threading.Lock()
+lidar_obstacle_data: Dict[str, Any] = {
+    "timestamp": 0.0,
+    "emergency_stop": False,
+    "avoidance_steering": 0.0,
+    "min_front_dist": None,
+    "active": True
+}
 
 
 def _gps_log(level: str, message: str) -> None:
@@ -1399,7 +1473,8 @@ HTML_PAGE = r"""
     </section>
 
     <section>
-        <div class="card">
+        <div style="display:flex; gap:16px; flex-wrap:wrap;">
+        <div class="card" style="flex:1; min-width:340px;">
             <h2>LiDAR LDROBOT STL-06P</h2>
 
             <div class="lidar-container">
@@ -1455,6 +1530,59 @@ HTML_PAGE = r"""
                 <button onclick="lidarLoadConfig()">Carregar config</button>
                 <button class="button-secondary" onclick="lidarSaveConfig()">Salvar config</button>
             </div>
+        </div>
+
+        <div class="card" style="flex:1; min-width:340px;">
+            <h2>Depth Camera Orbbec Astra Pro</h2>
+
+            <div style="text-align:center;">
+                <img id="depthImage" src=""
+                     style="width:100%;max-width:420px;border-radius:10px;border:1px solid #475569;
+                            background:#020617;min-height:220px;display:block;margin:0 auto;"
+                     alt="Depth stream">
+            </div>
+
+            <div class="lidar-metrics-row" style="margin-top:8px;">
+                <div class="lidar-metric">
+                    <strong id="depthStatusCard">OFF</strong>
+                    <span>Conexao</span>
+                </div>
+                <div class="lidar-metric">
+                    <strong id="depthFpsCard">0</strong>
+                    <span>FPS</span>
+                </div>
+                <div class="lidar-metric">
+                    <strong id="depthMinCard">-</strong>
+                    <span>Min (m)</span>
+                </div>
+                <div class="lidar-metric">
+                    <strong id="depthMaxCard">-</strong>
+                    <span>Max (m)</span>
+                </div>
+            </div>
+
+            <div class="row" style="margin-top:6px;">
+                <div>
+                    <label style="font-size:11px;">Dist. minima (mm)</label>
+                    <input id="depthMinMm" type="number" min="100" max="5000" value="500"
+                           style="padding:4px;font-size:11px;" onchange="depthSaveConfig()">
+                </div>
+                <div>
+                    <label style="font-size:11px;">Dist. maxima (mm)</label>
+                    <input id="depthMaxMm" type="number" min="1000" max="20000" value="8000"
+                           style="padding:4px;font-size:11px;" onchange="depthSaveConfig()">
+                </div>
+            </div>
+
+            <div style="display:flex;justify-content:center;gap:16px;margin-top:6px;">
+                <span style="font-size:10px;color:#ef4444;">&#9632; perto</span>
+                <span style="font-size:10px;color:#eab308;">&#9632; medio</span>
+                <span style="font-size:10px;color:#22c55e;">&#9632; longe</span>
+                <span style="font-size:10px;color:#2563eb;">&#9632; muito longe</span>
+            </div>
+
+            <p class="muted" id="depthError" style="margin-top:6px;font-size:12px;"></p>
+        </div>
         </div>
 
         <div class="card">
@@ -1518,8 +1646,40 @@ HTML_PAGE = r"""
             </div>
 
             <div class="row" style="margin-top:6px;">
-                <button onclick="gpsDownloadJSON()">&#11015; Baixar JSON</button>
+                <button class="button-green" onclick="gpsDownloadGPX()">&#11015; Baixar GPX</button>
+                <button class="button-secondary button-yellow" onclick="gpsClearMap()">&#128465; Limpar mapa</button>
+            </div>
+            <div class="row" style="margin-top:4px;">
+                <button class="button-secondary" onclick="gpsUploadGPX()">&#128194; Upload GPX</button>
+                <input type="file" id="gpsUploadInput" accept=".gpx" style="display:none" onchange="gpsHandleUpload(this.files[0])">
                 <button class="button-secondary" onclick="gpsTogglePower()" id="btnGpsPower">&#9889; Ligar GPS</button>
+            </div>
+
+            <div id="gpsFollowSection" style="display:none;margin-top:10px;padding:8px;background:#020617;border:1px solid #334155;border-radius:10px;">
+                <div style="font-size:12px;color:#94a3b8;margin-bottom:6px;" id="gpsFollowInfo">Trajeto carregado: 0 pontos</div>
+                <div class="row">
+                    <button class="button-green" onclick="gpsFollowStart()" id="btnFollowStart">&#9654; Seguir trajeto</button>
+                    <button class="button-danger" onclick="gpsFollowStop()" id="btnFollowStop" disabled>&#9209; Parar</button>
+                </div>
+                <div id="gpsFollowProgress" style="display:none;margin-top:6px;font-size:13px;color:#22c55e;">
+                    WP <span id="followWpIndex">0</span>/<span id="followWpTotal">0</span> &middot; <span id="followDist">0</span>m &middot; <span id="followSpeed">0.0</span> km/h
+                </div>
+                <div style="margin-top:6px;display:grid;grid-template-columns:1fr 1fr;gap:6px;">
+                    <div>
+                        <label style="font-size:11px;">Dist. segura (cm)</label>
+                        <input id="gpsSafeDist" type="number" min="10" max="200" value="50"
+                               style="padding:4px;font-size:11px;margin-top:2px;" onchange="gpsSaveFollowConfig()">
+                    </div>
+                    <div>
+                        <label style="font-size:11px;">Dist. critica (cm)</label>
+                        <input id="gpsCritDist" type="number" min="5" max="100" value="30"
+                               style="padding:4px;font-size:11px;margin-top:2px;" onchange="gpsSaveFollowConfig()">
+                    </div>
+                </div>
+                <label style="font-size:12px;margin-top:4px;display:block;">
+                    <input type="checkbox" id="gpsAvoidance" checked onchange="gpsToggleAvoidance()">
+                    &#128737; Desviar de obstaculos (LiDAR)
+                </label>
             </div>
 
             <div class="gps-config-row" style="margin-top:6px;">
@@ -2825,6 +2985,9 @@ HTML_PAGE = r"""
     let gpsPowered = false;
     let gpsConnected = false;
     let gpsLastFix = 0;
+    let gpsUploadedLine = null;
+    let gpsWaypointMarker = null;
+    let gpsLastSpeed = "0.0";
 
     function gpsInitMap() {
         if (gpsMap) return;
@@ -2996,7 +3159,8 @@ HTML_PAGE = r"""
         if (data.altitude != null) byId("gpsAlt").textContent = Number(data.altitude).toFixed(1) + "m";
         else byId("gpsAlt").textContent = "-";
 
-        byId("gpsSpeed").textContent = data.speed_kmh != null ? Number(data.speed_kmh).toFixed(1) : "-";
+        gpsLastSpeed = data.speed_kmh != null ? Number(data.speed_kmh).toFixed(1) : "0.0";
+        byId("gpsSpeed").textContent = gpsLastSpeed !== "0.0" ? gpsLastSpeed : "-";
         byId("gpsHeading").textContent = data.heading != null ? Math.round(Number(data.heading)) : "-";
         if (data.utc_time) {
             const t = String(data.utc_time).replace(/\.\d+$/, "");
@@ -3057,6 +3221,57 @@ HTML_PAGE = r"""
     });
 
     socket.on("gps_log", gpsLogLine);
+
+    socket.on("gps_follow_status", data => {
+        if (!data) return;
+        const active = data.active || false;
+        byId("btnFollowStart").disabled = active;
+        byId("btnFollowStop").disabled = !active;
+        if (active) {
+            byId("gpsFollowProgress").style.display = "block";
+            byId("followWpIndex").textContent = data.wp_index || 0;
+            byId("followWpTotal").textContent = data.wp_total || 0;
+            byId("followDist").textContent = data.distance || 0;
+            if (gpsLastSpeed) byId("followSpeed").textContent = gpsLastSpeed;
+        } else {
+            byId("gpsFollowProgress").style.display = "none";
+            byId("followWpIndex").textContent = "0";
+            byId("followWpTotal").textContent = "0";
+            byId("followDist").textContent = "0";
+            if (gpsWaypointMarker && gpsMap) gpsMap.removeLayer(gpsWaypointMarker);
+            gpsWaypointMarker = null;
+        }
+    });
+
+    socket.on("depth_frame", data => {
+        if (!data || !data.image) return;
+        byId("depthImage").src = data.image;
+        byId("depthStatusCard").textContent = "ON";
+        byId("depthStatusCard").className = "status-ok";
+        if (data.min_mm) byId("depthMinCard").textContent = (data.min_mm / 1000).toFixed(1) + "m";
+        if (data.max_mm) byId("depthMaxCard").textContent = (data.max_mm / 1000).toFixed(1) + "m";
+        byId("depthError").textContent = "";
+    });
+
+    socket.on("depth_status", data => {
+        if (!data) return;
+        if (data.connected) {
+            byId("depthStatusCard").textContent = "ON";
+            byId("depthStatusCard").className = "status-ok";
+        } else {
+            byId("depthStatusCard").textContent = "OFF";
+            byId("depthStatusCard").className = "status-off";
+        }
+        if (data.fps) byId("depthFpsCard").textContent = Math.round(data.fps);
+        if (data.error) {
+            byId("depthError").textContent = data.error;
+        } else {
+            byId("depthError").textContent = "";
+        }
+        if (!data.depth_available && data.depth_import_error) {
+            byId("depthError").textContent = data.depth_import_error;
+        }
+    });
 
     async function gpsLoadConfig() {
         try {
@@ -3140,25 +3355,166 @@ HTML_PAGE = r"""
         }
     }
 
-    async function gpsDownloadJSON() {
+    function gpsClearMap() {
+        if (gpsUploadedLine && gpsMap) gpsMap.removeLayer(gpsUploadedLine);
+        gpsUploadedLine = null;
+        if (gpsTrajectoryLine) gpsTrajectoryLine.setLatLngs([]);
+        gpsTrajectoryCoords = [];
+        if (gpsWaypointMarker && gpsMap) gpsMap.removeLayer(gpsWaypointMarker);
+        gpsWaypointMarker = null;
+        fetch("/api/gps/trajectory/uploaded", { method: "DELETE" });
+        byId("gpsFollowSection").style.display = "none";
+        byId("gpsTrajectoryPoints").textContent = "0";
+        byId("gpsUploadInput").value = "";
+        addLog("Mapa limpo.");
+    }
+
+    async function gpsDownloadGPX() {
         try {
-            const resp = await fetch("/api/gps/trajectory/download-full");
-            const data = await resp.json();
-            const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+            const resp = await fetch("/api/gps/trajectory/download-gpx");
+            if (!resp.ok) { addLog("Nenhum trajeto para baixar."); return; }
+            const blob = await resp.blob();
             const url = URL.createObjectURL(blob);
             const a = document.createElement("a");
             a.href = url;
-            a.download = "trajeto_gps_" + new Date().toISOString().replace(/[:.]/g, "-") + ".json";
+            const ts = new Date().toISOString().replace(/[:.]/g, "-");
+            a.download = "trajeto_pandorapi_" + ts + ".gpx";
             a.click();
             URL.revokeObjectURL(url);
-            addLog("Trajeto baixado: " + (data.metadata ? data.metadata.total_points : "?") + " pontos.");
+            addLog("GPX baixado com sucesso.");
         } catch (e) {
-            addLog("Erro ao baixar JSON.");
+            addLog("Erro ao baixar GPX.");
         }
+    }
+
+    function gpsUploadGPX() {
+        byId("gpsUploadInput").click();
+    }
+
+    async function gpsHandleUpload(file) {
+        if (!file) return;
+        if (!file.name.endsWith(".gpx")) { addLog("Apenas arquivos .gpx sao aceitos."); return; }
+        const formData = new FormData();
+        formData.append("file", file);
+        try {
+            const resp = await fetch("/api/gps/trajectory/upload", { method: "POST", body: formData });
+            const result = await resp.json();
+            if (result.ok) {
+                addLog("GPX carregado: " + result.point_count + " pontos.");
+                byId("gpsFollowInfo").textContent = "Trajeto carregado: " + result.point_count + " pontos";
+                byId("gpsFollowSection").style.display = "block";
+                const ptsResp = await fetch("/api/gps/trajectory/uploaded");
+                const ptsData = await ptsResp.json();
+                if (gpsMap && ptsData.points.length > 0) {
+                    const coords = ptsData.points.filter(p => p.lat != null && p.lng != null).map(p => L.latLng(p.lat, p.lng));
+                    if (gpsUploadedLine) gpsMap.removeLayer(gpsUploadedLine);
+                    gpsUploadedLine = L.polyline(coords, { color: "#ef4444", weight: 3, opacity: 0.7 }).addTo(gpsMap);
+                    if (coords.length > 0) gpsMap.fitBounds(gpsUploadedLine.getBounds().pad(0.1));
+                }
+            } else {
+                addLog("Erro: " + (result.error || "Falha no upload"));
+            }
+            byId("gpsUploadInput").value = "";
+        } catch (e) {
+            addLog("Erro ao enviar GPX.");
+        }
+    }
+
+    async function gpsSaveFollowConfig() {
+        const safe = parseInt(byId("gpsSafeDist").value) || 50;
+        const crit = parseInt(byId("gpsCritDist").value) || 30;
+        try {
+            await fetch("/api/gps/follow/config", {
+                method: "PUT",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ safe_distance_mm: safe * 10, critical_distance_mm: crit * 10 })
+            });
+        } catch (e) {}
+    }
+
+    async function gpsToggleAvoidance() {
+        const enabled = byId("gpsAvoidance").checked;
+        try {
+            await fetch("/api/gps/follow/config", {
+                method: "PUT",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ avoidance_enabled: enabled })
+            });
+        } catch (e) {}
+    }
+
+    async function gpsLoadFollowConfig() {
+        try {
+            const resp = await fetch("/api/gps/follow/config");
+            const cfg = await resp.json();
+            byId("gpsSafeDist").value = Math.round((cfg.safe_distance_mm || 500) / 10);
+            byId("gpsCritDist").value = Math.round((cfg.critical_distance_mm || 300) / 10);
+            byId("gpsAvoidance").checked = cfg.avoidance_enabled !== false;
+        } catch (e) {}
+    }
+
+    async function gpsFollowStart() {
+        try {
+            const resp = await fetch("/api/gps/follow/start", { method: "POST" });
+            const result = await resp.json();
+            addLog(result.message || result.error || "");
+        } catch (e) {
+            addLog("Erro ao iniciar follow.");
+        }
+    }
+
+    async function gpsFollowStop() {
+        try {
+            const resp = await fetch("/api/gps/follow/stop", { method: "POST" });
+            const result = await resp.json();
+            addLog(result.message || result.error || "");
+        } catch (e) {
+            addLog("Erro ao parar follow.");
+        }
+    }
+
+    async function gpsRestoreUploadedTrajectory() {
+        try {
+            const resp = await fetch("/api/gps/trajectory/uploaded");
+            const data = await resp.json();
+            if (data.loaded && data.points && data.points.length > 0) {
+                byId("gpsFollowInfo").textContent = "Trajeto carregado: " + data.point_count + " pontos";
+                byId("gpsFollowSection").style.display = "block";
+                if (gpsMap) {
+                    const coords = data.points.filter(p => p.lat != null && p.lng != null).map(p => L.latLng(p.lat, p.lng));
+                    if (gpsUploadedLine) gpsMap.removeLayer(gpsUploadedLine);
+                    gpsUploadedLine = L.polyline(coords, { color: "#ef4444", weight: 3, opacity: 0.7 }).addTo(gpsMap);
+                }
+            }
+        } catch (e) {}
+    }
+
+    async function depthLoadConfig() {
+        try {
+            const resp = await fetch("/api/depth/config");
+            const cfg = await resp.json();
+            byId("depthMinMm").value = cfg.min_depth_mm || 500;
+            byId("depthMaxMm").value = cfg.max_depth_mm || 8000;
+        } catch (e) {}
+    }
+
+    async function depthSaveConfig() {
+        const minMm = parseInt(byId("depthMinMm").value) || 500;
+        const maxMm = parseInt(byId("depthMaxMm").value) || 8000;
+        try {
+            await fetch("/api/depth/config", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ min_depth_mm: minMm, max_depth_mm: maxMm })
+            });
+        } catch (e) {}
     }
 
     gpsLoadConfig();
     gpsInitMap();
+    gpsRestoreUploadedTrajectory();
+    gpsLoadFollowConfig();
+    depthLoadConfig();
 </script>
 </body>
 </html>
@@ -3750,6 +4106,18 @@ def handle_key_event(event: Any, mappings: Dict[str, str]) -> None:
 
     if code == get_can_config().get("deadman_button", "BTN_TR"):
         robot_update_from_gamepad(force=True)
+
+    brake_button = get_can_config().get("brake_button", "BTN_SOUTH")
+    if code == brake_button:
+        if event.value in [1, 2]:
+            brake_current = float(get_can_config().get("brake_current", 8.0))
+            with robot_lock:
+                robot_state["brake_active"] = True
+            robot_brake(brake_current, force=True)
+        elif event.value == 0:
+            with robot_lock:
+                robot_state["brake_active"] = False
+            robot_brake(0.0, force=True)
 
 
 def handle_abs_event(event: Any, mappings: Dict[str, str], abs_infos: Dict[str, Any], deadzone: float) -> None:
@@ -4370,6 +4738,11 @@ def get_can_config() -> Dict[str, Any]:
 
     can_config["interface"] = str(can_config.get("interface", "can0")).strip() or "can0"
     can_config["deadman_button"] = str(can_config.get("deadman_button", "BTN_TR")).strip() or "BTN_TR"
+    can_config["brake_button"] = str(can_config.get("brake_button", "BTN_SOUTH")).strip() or "BTN_SOUTH"
+    try:
+        can_config["brake_current"] = max(0.0, min(200.0, float(can_config.get("brake_current", 8.0))))
+    except Exception:
+        can_config["brake_current"] = 8.0
 
     return can_config
 
@@ -4571,6 +4944,47 @@ def vesc_send_duty(interface_name: str, vesc_id: int, duty: float) -> Dict[str, 
     return socketcan_send_extended(interface_name, arbitration_id, data)
 
 
+def vesc_send_current_brake(interface_name: str, vesc_id: int, current_a: float) -> Dict[str, Any]:
+    current_a = max(0.0, min(200.0, float(current_a)))
+    scaled = int(current_a * 1000.0)
+    data = struct.pack(">i", scaled)
+    arbitration_id = build_vesc_ext_id(CAN_PACKET_SET_CURRENT_BRAKE, int(vesc_id))
+    return socketcan_send_extended(interface_name, arbitration_id, data)
+
+
+def robot_brake(current_a: float, force: bool = False) -> Dict[str, Any]:
+    can_config = get_can_config()
+    now = time.time()
+
+    with robot_lock:
+        if not force:
+            elapsed = now - float(robot_state.get("last_send_time", 0.0))
+            if elapsed < float(can_config.get("send_interval", 0.05)):
+                return {"ok": True, "skipped": True, "reason": "rate_limit"}
+        robot_state["last_send_time"] = now
+
+    interface_name = can_config["interface"]
+    left_id = can_config["left_id"]
+    right_id = can_config["right_id"]
+
+    left_result = vesc_send_current_brake(interface_name, left_id, current_a)
+    right_result = vesc_send_current_brake(interface_name, right_id, current_a)
+
+    ok = bool(left_result.get("ok")) and bool(right_result.get("ok"))
+
+    with robot_lock:
+        robot_state["last_tx"] = {
+            "left": left_result,
+            "right": right_result,
+            "timestamp": now
+        }
+        robot_state["last_error"] = None if ok else json.dumps(robot_state["last_tx"], ensure_ascii=False)
+
+    emit_can_status()
+
+    return {"ok": ok, "current_a": current_a, "left": left_result, "right": right_result}
+
+
 def robot_send_duty(left_duty: float, right_duty: float, force: bool = False) -> Dict[str, Any]:
     can_config = get_can_config()
     now = time.time()
@@ -4660,6 +5074,11 @@ def robot_update_from_gamepad(force: bool = False) -> Dict[str, Any]:
 
     if not deadman_ok:
         return robot_stop(force=True)
+
+    if robot_state.get("brake_active"):
+        robot_send_duty(0.0, 0.0, force=True)
+        robot_brake(float(can_config.get("brake_current", 8.0)), force=True)
+        return {"ok": True, "braking": True}
 
     throttle_axis = can_config.get("throttle_axis", "ABS_Y")
     steering_axis = can_config.get("steering_axis", "ABS_X")
@@ -4967,6 +5386,8 @@ def lidar_reader_loop() -> None:
                         if now - last_emit_time >= emit_interval and accumulated_points:
                             pts = sorted(accumulated_points.values(), key=lambda p: p["angle"])
                             emit_lidar_frame(pts)
+                            if follow_state.get("active"):
+                                update_lidar_obstacle_map(pts)
                             last_emit_time = now
 
                             accumulated_points.clear()
@@ -5025,6 +5446,151 @@ def lidar_reader_loop() -> None:
                 lidar_state["scanning"] = False
 
             emit_lidar_status()
+
+
+def get_depth_config() -> Dict[str, Any]:
+    config = load_config()
+    depth_config = dict(DEFAULT_CONFIG["depth_camera"])
+    existing = config.get("depth_camera", {})
+    if isinstance(existing, dict):
+        depth_config.update(existing)
+    try:
+        depth_config["min_depth_mm"] = max(100, min(10000, int(depth_config.get("min_depth_mm", 500))))
+    except Exception:
+        depth_config["min_depth_mm"] = 500
+    try:
+        depth_config["max_depth_mm"] = max(500, min(20000, int(depth_config.get("max_depth_mm", 8000))))
+    except Exception:
+        depth_config["max_depth_mm"] = 8000
+    try:
+        depth_config["emit_fps"] = max(3, min(30, int(depth_config.get("emit_fps", 10))))
+    except Exception:
+        depth_config["emit_fps"] = 10
+    return depth_config
+
+
+def save_depth_config(update: Dict[str, Any]) -> Dict[str, Any]:
+    config = load_config()
+    depth_config = get_depth_config()
+    allowed = set(DEFAULT_CONFIG["depth_camera"].keys())
+    for key, value in update.items():
+        if key in allowed:
+            depth_config[key] = value
+    config["depth_camera"] = depth_config
+    save_config(config)
+    with depth_lock:
+        depth_state["min_depth_mm"] = depth_config["min_depth_mm"]
+        depth_state["max_depth_mm"] = depth_config["max_depth_mm"]
+    depth_restart_event.set()
+    return get_depth_config()
+
+
+def emit_depth_status() -> None:
+    with depth_lock:
+        payload = {
+            "connected": depth_state["connected"],
+            "fps": depth_state["fps"],
+            "min_depth_mm": depth_state["min_depth_mm"],
+            "max_depth_mm": depth_state["max_depth_mm"],
+            "width": depth_state["width"],
+            "height": depth_state["height"],
+            "error": depth_state["error"],
+            "depth_available": depth_state.get("depth_available", False),
+            "depth_import_error": depth_state.get("depth_import_error", "")
+        }
+    socketio.emit("depth_status", payload)
+
+
+def depth_camera_loop() -> None:
+    if not DEPTH_AVAILABLE:
+        with depth_lock:
+            depth_state["connected"] = False
+            depth_state["error"] = "ob_depth nao disponivel: " + DEPTH_IMPORT_ERROR
+        emit_depth_status()
+        return
+
+    while True:
+        depth_restart_event.clear()
+
+        depth_config = get_depth_config()
+        min_mm = depth_config["min_depth_mm"]
+        max_mm = depth_config["max_depth_mm"]
+        emit_fps = depth_config["emit_fps"]
+
+        with depth_lock:
+            depth_state["min_depth_mm"] = min_mm
+            depth_state["max_depth_mm"] = max_mm
+
+        cam = None
+        try:
+            import numpy as np
+            import cv2
+
+            cam = DepthCamera()
+            cam.start(width=640, height=480, fps=30)
+
+            with depth_lock:
+                depth_state["connected"] = True
+                depth_state["error"] = None
+                depth_state["width"] = cam.width
+                depth_state["height"] = cam.height
+
+            emit_depth_status()
+
+            frame_count = 0
+            fps_timer = time.time()
+
+            while not depth_restart_event.is_set():
+                frame = cam.get_frame(timeout_ms=1000)
+                if frame is None:
+                    continue
+
+                clipped = np.clip(frame, min_mm, max_mm)
+                norm = ((clipped - min_mm) / max(1, (max_mm - min_mm)) * 255).astype(np.uint8)
+                colored = cv2.applyColorMap(norm, cv2.COLORMAP_JET)
+                _, jpeg = cv2.imencode('.jpg', colored, [cv2.IMWRITE_JPEG_QUALITY, 60])
+                b64 = base64.b64encode(jpeg).decode('ascii')
+
+                socketio.emit("depth_frame", {
+                    "image": "data:image/jpeg;base64," + b64,
+                    "width": cam.width,
+                    "height": cam.height,
+                    "min_mm": min_mm,
+                    "max_mm": max_mm,
+                    "timestamp": time.time()
+                })
+
+                frame_count += 1
+                now = time.time()
+                if now - fps_timer >= 2.0:
+                    with depth_lock:
+                        depth_state["fps"] = round(frame_count / (now - fps_timer), 1)
+                    frame_count = 0
+                    fps_timer = now
+
+                elapsed = time.time() - now
+                target = 1.0 / emit_fps
+                if elapsed < target:
+                    time.sleep(target - elapsed)
+
+        except Exception as e:
+            with depth_lock:
+                depth_state["connected"] = False
+                depth_state["error"] = str(e)
+            emit_depth_status()
+            time.sleep(3)
+
+        finally:
+            if cam is not None:
+                try:
+                    cam.close()
+                except Exception:
+                    pass
+            with depth_lock:
+                depth_state["connected"] = False
+            emit_depth_status()
+            if not depth_restart_event.is_set():
+                time.sleep(2)
 
 
 def get_gps_config() -> Dict[str, Any]:
@@ -5200,6 +5766,135 @@ def trajectory_to_json() -> Dict[str, Any]:
     }
 
 
+def haversine_distance(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
+    R = 6371000.0
+    phi1 = math.radians(lat1)
+    phi2 = math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlam = math.radians(lng2 - lng1)
+    a_val = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlam / 2) ** 2
+    return R * 2 * math.atan2(math.sqrt(a_val), math.sqrt(1 - a_val))
+
+
+def bearing_to(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
+    phi1 = math.radians(lat1)
+    phi2 = math.radians(lat2)
+    dlam = math.radians(lng2 - lng1)
+    x = math.sin(dlam) * math.cos(phi2)
+    y = math.cos(phi1) * math.sin(phi2) - math.sin(phi1) * math.cos(phi2) * math.cos(dlam)
+    bearing = math.degrees(math.atan2(x, y))
+    return (bearing + 360) % 360
+
+
+def angle_diff(a: float, b: float) -> float:
+    diff = (a - b + 180) % 360 - 180
+    if diff > 180:
+        diff -= 360
+    elif diff < -180:
+        diff += 360
+    return diff
+
+
+def trajectory_to_gpx() -> str:
+    with trajectory_lock:
+        points = list(trajectory_state["points"])
+        start_time = trajectory_state["start_time"]
+    if not points:
+        return ""
+    start_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.localtime(start_time)) if start_time else time.strftime("%Y-%m-%dT%H:%M:%SZ", time.localtime())
+    lines = [
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        '<gpx version="1.1" creator="PandoraPi" xmlns="http://www.topografix.com/GPX/1/1">',
+        '  <metadata><time>' + start_iso + '</time></metadata>',
+        '  <trk>',
+        '    <name>Trajeto PandoraPi</name>',
+        '    <trkseg>'
+    ]
+    for pt in points:
+        lat = pt.get("lat")
+        lng = pt.get("lng")
+        if lat is None or lng is None:
+            continue
+        lines.append('      <trkpt lat="' + str(round(lat, 7)) + '" lon="' + str(round(lng, 7)) + '">')
+        alt = pt.get("alt")
+        if alt is not None:
+            lines.append('        <ele>' + str(round(alt, 1)) + '</ele>')
+        epoch = pt.get("epoch")
+        if epoch:
+            pt_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.localtime(epoch))
+            lines.append('        <time>' + pt_iso + '</time>')
+        spd = pt.get("speed_kmh")
+        if spd is not None:
+            lines.append('        <speed>' + str(round(spd, 2)) + '</speed>')
+        hdg = pt.get("heading")
+        if hdg is not None:
+            lines.append('        <course>' + str(round(hdg, 1)) + '</course>')
+        lines.append('      </trkpt>')
+    lines.append('    </trkseg>')
+    lines.append('  </trk>')
+    lines.append('</gpx>')
+    return "\n".join(lines)
+
+
+ns = {"gpx": "http://www.topografix.com/GPX/1/1"}
+
+
+def parse_gpx_xml(xml_string: str) -> Dict[str, Any]:
+    try:
+        root = ET.fromstring(xml_string)
+    except ET.ParseError as e:
+        return {"ok": False, "error": f"Erro no XML: {e}", "points": [], "point_count": 0, "filename": ""}
+    tag = root.tag
+    is_gpx = tag == "{http://www.topografix.com/GPX/1/1}gpx" or tag == "gpx"
+    if not is_gpx:
+        return {"ok": False, "error": "Arquivo nao parece ser GPX valido", "points": [], "point_count": 0, "filename": ""}
+    name = ""
+    name_el = root.find(".//gpx:trk/gpx:name", ns) or root.find(".//{http://www.topografix.com/GPX/1/1}trk/{http://www.topografix.com/GPX/1/1}name")
+    if name_el is None:
+        name_el = root.find(".//trk/name")
+    if name_el is not None and name_el.text:
+        name = name_el.text.strip()
+    points: List[Dict[str, Any]] = []
+    trkpts = root.findall(".//gpx:trkpt", ns)
+    if not trkpts:
+        trkpts = root.findall(".//{http://www.topografix.com/GPX/1/1}trkpt")
+    if not trkpts:
+        trkpts = root.findall(".//trkpt")
+    for trkpt in trkpts:
+        lat_s = trkpt.get("lat")
+        lon_s = trkpt.get("lon")
+        if lat_s is None or lon_s is None:
+            continue
+        try:
+            lat = float(lat_s)
+            lng = float(lon_s)
+        except (ValueError, TypeError):
+            continue
+        ele_val = None
+        ele_el = trkpt.find("gpx:ele", ns) or trkpt.find("{http://www.topografix.com/GPX/1/1}ele") or trkpt.find("ele")
+        if ele_el is not None and ele_el.text:
+            try:
+                ele_val = float(ele_el.text)
+            except ValueError:
+                pass
+        time_str = None
+        time_el = trkpt.find("gpx:time", ns) or trkpt.find("{http://www.topografix.com/GPX/1/1}time") or trkpt.find("time")
+        if time_el is not None and time_el.text:
+            time_str = time_el.text.strip()
+        points.append({
+            "lat": round(lat, 7),
+            "lng": round(lng, 7),
+            "alt": ele_val,
+            "time": time_str
+        })
+    return {
+        "ok": True,
+        "filename": name,
+        "points": points,
+        "point_count": len(points)
+    }
+
+
 def emit_gps_status() -> None:
     with gps_lock:
         payload = {
@@ -5234,6 +5929,187 @@ def emit_gps_trajectory_status() -> None:
             "start_time": trajectory_state["start_time"]
         }
     socketio.emit("gps_trajectory_status", payload)
+
+
+def emit_gps_follow_status() -> None:
+    with follow_lock:
+        payload = {
+            "active": follow_state["active"],
+            "wp_index": follow_state["wp_index"],
+            "wp_total": follow_state["wp_total"],
+            "distance": follow_state["distance"],
+            "bearing": follow_state["bearing"],
+            "throttle": follow_state["throttle"],
+            "steering": follow_state["steering"],
+            "error": follow_state["error"]
+        }
+    socketio.emit("gps_follow_status", payload)
+
+
+def update_lidar_obstacle_map(points: List[Dict[str, Any]]) -> None:
+    if not lidar_obstacle_data.get("active", True):
+        return
+    num_sectors = 18
+    safe_mm = follow_config.get("safe_distance_mm", 500)
+    critical_mm = follow_config.get("critical_distance_mm", 300)
+    sectors = [safe_mm + 1.0] * num_sectors
+    for pt in points:
+        angle = pt.get("angle", 0)
+        dist = pt.get("distance", 0)
+        if dist <= 0:
+            continue
+        if angle > 180:
+            continue
+        sector = int((angle + 90) / (180 // num_sectors))
+        sector = max(0, min(num_sectors - 1, sector))
+        if dist < sectors[sector]:
+            sectors[sector] = dist
+    front_left = num_sectors // 2 - 1
+    front_right = num_sectors // 2
+    min_front = min(sectors[front_left], sectors[front_right])
+    emergency = min_front < critical_mm
+    steer_sum = 0.0
+    total_weight = 0.0
+    for s in range(num_sectors):
+        if sectors[s] < safe_mm:
+            force = (safe_mm - sectors[s]) / safe_mm
+            center_angle = (s + 0.5) * (180.0 / num_sectors) - 90.0
+            steer_sum += force * (-center_angle / 90.0)
+            total_weight += force
+    avoidance = 0.0
+    if total_weight > 0:
+        avoidance = max(-1.0, min(1.0, steer_sum / total_weight))
+    with lidar_obstacle_lock:
+        lidar_obstacle_data["timestamp"] = time.time()
+        lidar_obstacle_data["emergency_stop"] = emergency
+        lidar_obstacle_data["avoidance_steering"] = round(avoidance, 4)
+        lidar_obstacle_data["min_front_dist"] = min_front if min_front <= safe_mm else None
+
+
+def gps_follow_step() -> None:
+    if not follow_state["active"]:
+        return
+    with follow_lock:
+        ws = dict(follow_state)
+    points = uploaded_trajectory.get("points", [])
+    wp = ws["wp_index"]
+    if wp >= len(points):
+        follow_stop()
+        _gps_log("info", "Trajeto concluido. Ultimo waypoint atingido.")
+        return
+    with gps_lock:
+        lat = gps_state["latitude"]
+        lng = gps_state["longitude"]
+        fix = gps_state["fix"]
+        heading = gps_state["heading"] or 0.0
+        spd = gps_state["speed_kmh"] or 0.0
+    if fix < 2 or lat is None or lng is None:
+        robot_stop()
+        with follow_lock:
+            follow_state["error"] = "Sem fix GPS 3D. Pausado aguardando sinal."
+        emit_gps_follow_status()
+        return
+    if not robot_state.get("armed", False):
+        follow_stop()
+        _gps_log("warn", "Robo desarmado. Follow cancelado.")
+        return
+    target = points[wp]
+    t_lat = target.get("lat")
+    t_lng = target.get("lng")
+    if t_lat is None or t_lng is None:
+        with follow_lock:
+            follow_state["wp_index"] = wp + 1
+            follow_state["error"] = None
+        emit_gps_follow_status()
+        return
+    distance = haversine_distance(lat, lng, t_lat, t_lng)
+    bearing = bearing_to(lat, lng, t_lat, t_lng)
+    hdg_error = angle_diff(bearing, heading)
+    kp = follow_config["steering_kp"]
+    steering = max(-1.0, min(1.0, hdg_error * kp))
+    throttle = min(follow_config["max_auto_speed"], max(0.01, distance * 0.04))
+
+    if lidar_obstacle_data.get("active", True):
+        with lidar_obstacle_lock:
+            emergency = lidar_obstacle_data.get("emergency_stop", False)
+            avoidance = lidar_obstacle_data.get("avoidance_steering", 0.0)
+            min_front = lidar_obstacle_data.get("min_front_dist")
+        if emergency:
+            robot_stop()
+            with follow_lock:
+                front_mm = min_front if min_front else 0
+                follow_state["error"] = f"OBSTACULO! Parada emergencia ({front_mm:.0f}mm)"
+            emit_gps_follow_status()
+            return
+        weight = follow_config.get("avoidance_weight", 0.5)
+        if abs(avoidance) > 0.01:
+            steering = steering * (1.0 - weight) + avoidance * weight
+        safe_mm = follow_config.get("safe_distance_mm", 500)
+        if min_front is not None and min_front < safe_mm and min_front > 0:
+            factor = min_front / safe_mm
+            throttle *= max(0.0, factor)
+            if throttle < 0.01:
+                throttle = 0.0
+
+    threshold = follow_config["waypoint_threshold"]
+    if distance < threshold:
+        wp += 1
+        with follow_lock:
+            follow_state["wp_index"] = wp
+            follow_state["error"] = None
+        _gps_log("info", f"Waypoint {wp}/{follow_state['wp_total']} atingido ({round(distance,1)}m)")
+        emit_gps_follow_status()
+        if wp >= len(points):
+            follow_stop()
+            _gps_log("info", "Trajeto concluido.")
+            return
+        emit_gps_follow_status()
+        return
+    left_raw = throttle + steering
+    right_raw = throttle - steering
+    left = max(-1.0, min(1.0, left_raw))
+    right = max(-1.0, min(1.0, right_raw))
+    robot_send_duty(left, right, force=True)
+    with follow_lock:
+        follow_state["distance"] = round(distance, 1)
+        follow_state["bearing"] = round(bearing, 1)
+        follow_state["throttle"] = round(throttle, 3)
+        follow_state["steering"] = round(steering, 3)
+        follow_state["error"] = None
+    emit_gps_follow_status()
+
+
+def follow_start() -> Dict[str, Any]:
+    if not uploaded_trajectory.get("loaded"):
+        return {"ok": False, "error": "Nenhum trajeto carregado. Faca upload de um GPX primeiro."}
+    with gps_lock:
+        fix = gps_state["fix"]
+    if fix < 1:
+        return {"ok": False, "error": "Sem fix GPS. Aguarde sinal antes de iniciar."}
+    if not robot_state.get("armed", False):
+        return {"ok": False, "error": "Robo nao esta armado. Arme primeiro."}
+    points = uploaded_trajectory["points"]
+    with follow_lock:
+        follow_state["active"] = True
+        follow_state["wp_index"] = 0
+        follow_state["wp_total"] = len(points)
+        follow_state["distance"] = 0.0
+        follow_state["bearing"] = 0.0
+        follow_state["throttle"] = 0.0
+        follow_state["steering"] = 0.0
+        follow_state["error"] = None
+    _gps_log("info", f"Follow iniciado: {len(points)} waypoints")
+    emit_gps_follow_status()
+    return {"ok": True, "message": f"Seguindo trajeto com {len(points)} waypoints"}
+
+
+def follow_stop() -> None:
+    with follow_lock:
+        follow_state["active"] = False
+        follow_state["error"] = None
+    robot_stop()
+    _gps_log("info", "Follow parado")
+    emit_gps_follow_status()
 
 
 def gps_reader_loop() -> None:
@@ -5405,6 +6281,9 @@ def gps_reader_loop() -> None:
                                             trajectory_state["points"].append(point)
                                             trajectory_state["point_count"] = len(trajectory_state["points"])
                                             socketio.emit("gps_trajectory_point", point)
+
+                                if follow_state.get("active"):
+                                    gps_follow_step()
 
                 except serial.SerialException as e:
                     _gps_log("error", f"Erro serial: {e}")
@@ -5670,6 +6549,119 @@ def api_trajectory_download_full():
 @app.route("/api/gps/log", methods=["GET"])
 def api_gps_log():
     return jsonify(list(gps_log_lines))
+
+
+@app.route("/api/gps/trajectory/download-gpx", methods=["GET"])
+def api_trajectory_download_gpx():
+    gpx = trajectory_to_gpx()
+    if not gpx:
+        return jsonify({"ok": False, "error": "Nenhum trajeto gravado"}), 404
+    from flask import Response
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    filename = f"trajeto_pandorapi_{timestamp}.gpx"
+    return Response(
+        gpx,
+        mimetype="application/gpx+xml",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'}
+    )
+
+
+@app.route("/api/gps/trajectory/upload", methods=["POST"])
+def api_trajectory_upload():
+    if "file" not in request.files:
+        return jsonify({"ok": False, "error": "Nenhum arquivo enviado"})
+    file = request.files["file"]
+    if file.filename == "":
+        return jsonify({"ok": False, "error": "Nome de arquivo vazio"})
+    try:
+        xml_string = file.read().decode("utf-8", errors="ignore")
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"Erro ao ler arquivo: {e}"})
+    result = parse_gpx_xml(xml_string)
+    if not result.get("ok"):
+        return jsonify(result)
+    uploaded_trajectory["filename"] = file.filename or result.get("filename", "")
+    uploaded_trajectory["points"] = result["points"]
+    uploaded_trajectory["point_count"] = result["point_count"]
+    uploaded_trajectory["loaded"] = True
+    _gps_log("info", f"GPX carregado: {uploaded_trajectory['filename']} — {result['point_count']} pontos")
+    return jsonify({
+        "ok": True,
+        "message": f"GPX carregado: {result['point_count']} pontos",
+        "point_count": result["point_count"],
+        "filename": uploaded_trajectory["filename"]
+    })
+
+
+@app.route("/api/gps/trajectory/uploaded", methods=["GET"])
+def api_trajectory_get_uploaded():
+    return jsonify({
+        "loaded": uploaded_trajectory["loaded"],
+        "filename": uploaded_trajectory["filename"],
+        "point_count": uploaded_trajectory["point_count"],
+        "points": uploaded_trajectory["points"]
+    })
+
+
+@app.route("/api/gps/trajectory/uploaded", methods=["DELETE"])
+def api_trajectory_clear_uploaded():
+    uploaded_trajectory["loaded"] = False
+    uploaded_trajectory["filename"] = ""
+    uploaded_trajectory["points"] = []
+    uploaded_trajectory["point_count"] = 0
+    _gps_log("info", "Trajeto carregado removido")
+    return jsonify({"ok": True, "message": "Trajeto removido"})
+
+
+@app.route("/api/gps/follow/start", methods=["POST"])
+def api_follow_start():
+    result = follow_start()
+    return jsonify(result)
+
+
+@app.route("/api/gps/follow/stop", methods=["POST"])
+def api_follow_stop():
+    follow_stop()
+    return jsonify({"ok": True, "message": "Follow parado"})
+
+
+@app.route("/api/gps/follow/status", methods=["GET"])
+def api_follow_get_status():
+    with follow_lock:
+        return jsonify(dict(follow_state))
+
+
+@app.route("/api/gps/follow/config", methods=["GET"])
+def api_follow_config_get():
+    return jsonify({
+        "safe_distance_mm": follow_config.get("safe_distance_mm", 500),
+        "critical_distance_mm": follow_config.get("critical_distance_mm", 300),
+        "avoidance_weight": follow_config.get("avoidance_weight", 0.5),
+        "avoidance_enabled": lidar_obstacle_data.get("active", True)
+    })
+
+
+@app.route("/api/gps/follow/config", methods=["PUT"])
+def api_follow_config_update():
+    data = request.get_json(force=True, silent=True) or {}
+    updated = {}
+    if "safe_distance_mm" in data:
+        val = max(100, min(2000, int(data.get("safe_distance_mm", 500))))
+        follow_config["safe_distance_mm"] = val
+        updated["safe_distance_mm"] = val
+    if "critical_distance_mm" in data:
+        val = max(50, min(1000, int(data.get("critical_distance_mm", 300))))
+        follow_config["critical_distance_mm"] = val
+        updated["critical_distance_mm"] = val
+    if "avoidance_weight" in data:
+        val = max(0.0, min(1.0, float(data.get("avoidance_weight", 0.5))))
+        follow_config["avoidance_weight"] = val
+        updated["avoidance_weight"] = val
+    if "avoidance_enabled" in data:
+        lidar_obstacle_data["active"] = bool(data["avoidance_enabled"])
+        updated["avoidance_enabled"] = lidar_obstacle_data["active"]
+    _gps_log("info", f"Config avoidance: {json.dumps(updated)}")
+    return jsonify(updated)
 
 
 @app.route("/")
@@ -5947,11 +6939,42 @@ def api_lidar_get_status():
         })
 
 
+@app.route("/api/depth/config", methods=["GET"])
+def api_depth_get_config():
+    return jsonify(get_depth_config())
+
+
+@app.route("/api/depth/config", methods=["POST"])
+def api_depth_set_config():
+    data = request.get_json(force=True, silent=True)
+    if not isinstance(data, dict):
+        data = {}
+    return jsonify(save_depth_config(data))
+
+
+@app.route("/api/depth/status", methods=["GET"])
+def api_depth_get_status():
+    with depth_lock:
+        return jsonify({
+            "connected": depth_state["connected"],
+            "fps": depth_state["fps"],
+            "min_depth_mm": depth_state["min_depth_mm"],
+            "max_depth_mm": depth_state["max_depth_mm"],
+            "width": depth_state["width"],
+            "height": depth_state["height"],
+            "error": depth_state["error"],
+            "depth_available": depth_state.get("depth_available", False),
+            "depth_import_error": depth_state.get("depth_import_error", "")
+        })
+
+
 @socketio.on("connect")
 def socket_connect():
     emit_status()
     emit_gps_status()
     emit_gps_trajectory_status()
+    emit_gps_follow_status()
+    emit_depth_status()
     for entry in gps_log_lines:
         socketio.emit("gps_log", entry)
 
@@ -6015,6 +7038,13 @@ if __name__ == "__main__":
         daemon=True
     )
     gps_thread.start()
+
+    if get_depth_config().get("enabled", True):
+        depth_thread = threading.Thread(
+            target=depth_camera_loop,
+            daemon=True
+        )
+        depth_thread.start()
 
     socketio.run(
         app,

@@ -4,3 +4,5 @@ __pycache__/
 gamepad_config.json
 *.log
 .env
+OrbbecSDK/
+lib/arm64/
