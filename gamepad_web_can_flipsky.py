@@ -1058,6 +1058,8 @@ HTML_PAGE = r"""
         .lidar-canvas-wrapper {
             position: relative;
             display: inline-block;
+            max-width: 420px;
+            width: 100%;
         }
 
         #lidarCanvas {
@@ -1065,6 +1067,8 @@ HTML_PAGE = r"""
             border: 1px solid #475569;
             border-radius: 14px;
             display: block;
+            width: 100%;
+            height: auto;
         }
 
         .lidar-metrics-row {
@@ -1536,13 +1540,16 @@ HTML_PAGE = r"""
             <h2>Depth Camera Orbbec Astra Pro</h2>
 
             <div style="text-align:center;">
-                <img id="depthImage" src=""
-                     style="width:100%;max-width:420px;border-radius:10px;border:1px solid #475569;
-                            background:#020617;min-height:220px;display:block;margin:0 auto;"
-                     alt="Depth stream">
+                <div style="max-width:420px; aspect-ratio:1; margin:0 auto;
+                            border-radius:10px; border:1px solid #475569;
+                            background:#020617; overflow:hidden;">
+                    <img id="depthImage" src=""
+                         style="width:100%; height:100%; object-fit:cover; display:block;"
+                         alt="Depth stream">
+                </div>
             </div>
 
-            <div class="lidar-metrics-row" style="margin-top:8px;">
+            <div class="lidar-metrics-row" style="margin-top:8px; grid-template-columns: repeat(4, 1fr);">
                 <div class="lidar-metric">
                     <strong id="depthStatusCard">OFF</strong>
                     <span>Conexao</span>

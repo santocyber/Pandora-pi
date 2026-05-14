@@ -188,26 +188,65 @@ Funções disponíveis: **Iniciar**, **Pausar**, **Retomar**, **Parar**. O downl
 
 ### Sistema (pacotes apt)
 
+| Pacote | Uso | Obrigatório |
+|---|---|---|
+| `python3 python3-pip` | Runtime Python | Sim |
+| `bluetooth bluez` | Stack Bluetooth + `bluetoothctl` | Sim (gamepad) |
+| `kmod` | `modprobe` / `modinfo` (módulos HID) | Sim |
+| `iproute2` | `ip link` (ativar interface CAN) | Sim |
+| `sudo` | Escalação de privilégios (CAN, serial) | Sim |
+| `can-utils` | `candump`, `cansend` (diagnóstico CAN) | Recomendado |
+| `evtest` | Teste de dispositivos de entrada | Recomendado |
+| `joystick` | Utilitários de joystick | Recomendado |
+| `usbutils` | `lsusb` (depuração USB) | Recomendado |
+| `libusb-1.0-0` | Dependência nativa do Orbbec SDK (`libob_usb.so`) | Somente Depth Camera |
+
 ```bash
-sudo apt install -y bluetooth bluez evtest joystick can-utils iproute2
+# Instalação completa (todos os componentes)
+sudo apt install -y python3 python3-pip bluetooth bluez kmod iproute2 sudo \
+  can-utils evtest joystick usbutils libusb-1.0-0
+
+# Instalação mínima (gamepad + CAN, sem periféricos)
+sudo apt install -y python3 python3-pip bluetooth bluez kmod iproute2 sudo
 ```
 
 ### Módulos do kernel
 
+| Módulo | Função | Quando carregar |
+|---|---|---|
+| `hidp` | HID sobre Bluetooth | Obrigatório para gamepad |
+| `hid-nintendo` | Driver Nintendo Switch Pro Controller | Obrigatório para Pro Controller |
+| `can` / `can_raw` | Subsistema SocketCAN | Carregado automaticamente pelo `ip link` |
+
 ```bash
 sudo modprobe hidp
 sudo modprobe hid-nintendo
+# Os módulos CAN (can, can_raw, can_dev) são carregados automaticamente
+# ao executar "sudo ip link set can0 up type can bitrate 500000"
 ```
 
 > Se `hid-nintendo` não existir no seu kernel, atualize o kernel ou use outro gamepad HID genérico.
 
-### Python
+### Python (pip)
+
+| Pacote | Uso | Obrigatório |
+|---|---|---|
+| `flask` | Framework web | Sim |
+| `flask-socketio` | WebSocket / eventos em tempo real | Sim |
+| `evdev` | Leitura de gamepad (`/dev/input/eventX`) | Sim (gamepad) |
+| `pyserial` | Comunicação serial (LiDAR + GPS A76XX) | Sim (LiDAR/GPS) |
+| `numpy` | Processamento de arrays (colormap depth) | Somente Depth Camera |
+| `opencv-python` | Colormap JET + compressão JPEG | Somente Depth Camera |
 
 ```bash
-pip install flask flask-socketio evdev pyserial numpy opencv-python pillow
+# Instalação completa (todos os componentes)
+pip install flask flask-socketio evdev pyserial numpy opencv-python
+
+# Instalação mínima (gamepad + CAN, sem LiDAR/GPS/Depth)
+pip install flask flask-socketio evdev
 ```
 
-> `pyserial` é necessário para LiDAR e GPS. `numpy` e `opencv-python` são necessários para a câmera depth (colormap + JPEG). O `evdev` é necessário para o gamepad. Se algum componente não estiver conectado, o módulo correspondente simplesmente não inicializa — o resto continua funcionando.
+> Cada componente é importado sob `try/except` — se faltar, o subsistema correspondente é desabilitado sem quebrar o resto. `pyserial` é necessário para LiDAR e GPS. `numpy` e `opencv-python` são necessários para a câmera depth (colormap + JPEG).
 
 ### Depth Camera (Orbbec Astra Pro)
 
