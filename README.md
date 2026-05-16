@@ -1,8 +1,14 @@
-# PandoraPi — Gamepad Bluetooth + CAN Flipsky + LiDAR + GPS A76XX + Depth Camera + Follow Autônomo
+# PandoraPi — Gamepad Bluetooth + CAN Flipsky + Monitor VESC + LiDAR + GPS A76XX + Depth Camera + Follow Autônomo
 
-Aplicação web que transforma um Raspberry Pi em uma central de controle para robôs com tração diferencial usando controladores **Flipsky 75100 (VESC)** conectados via barramento **CAN**. O comando é feito por **gamepad Bluetooth HID** (Nintendo Switch Pro Controller ou qualquer controle compatível com evdev). **LiDAR LDROBOT STL-06P** integrado como radar de navegação com nuvem de pontos 2D persistente (time-decay de 3 segundos). **GPS via modem SIMCom A76XX LTE** com visualização em mapa Leaflet, constelação de satélites em canvas, gravação de trajeto com exportação GPX/JSON, upload de rota GPX e navegação autônoma (follow) com desvio de obstáculos via LiDAR. **Depth Camera Orbbec Astra Pro** com streaming de profundidade colorizada (colormap JET) via `ob_depth.py` (wrapper ctypes). **Freio regenerativo** no botão B (`CAN_PACKET_SET_CURRENT_BRAKE`, 8A configurável).
+Duas aplicações web que transformam um Raspberry Pi em uma central de controle para robôs com tração diferencial usando controladores **Flipsky 75100 (VESC)** conectados via barramento **CAN** e/ou serial USB.
 
-Todo o sistema roda como um único script Python (~7000 linhas) — Flask + Socket.IO no backend, HTML/CSS/JS inline no frontend, leitura de gamepad via `evdev`, envio de quadros CAN raw via SocketCAN, leitura serial do LiDAR e modem GPS via `pyserial`, e câmera depth via `ob_depth.py` (ctypes wrapper para libOrbbecSDK.so).
+### `gamepad_web_can_flipsky.py` (porta 5005)
+Controle via **gamepad Bluetooth HID** (Nintendo Switch Pro Controller ou qualquer controle compatível com evdev). **LiDAR LDROBOT STL-06P** integrado como radar de navegação com nuvem de pontos 2D persistente (time-decay de 3 segundos). **GPS via modem SIMCom A76XX LTE** com visualização em mapa Leaflet, constelação de satélites em canvas, gravação de trajeto com exportação GPX/JSON, upload de rota GPX e navegação autônoma (follow) com desvio de obstáculos via LiDAR. **Depth Camera Orbbec Astra Pro** com streaming de profundidade colorizada (colormap JET) via `ob_depth.py` (wrapper ctypes). **Freio regenerativo** no botão B (`CAN_PACKET_SET_CURRENT_BRAKE`, 8A configurável).
+
+### `vesc_read.py` (porta 5008)
+Monitor direto do VESC com pyvesc via **serial USB** — telemetria em tempo real (tensão, corrente, RPM, duty cycle, potência, temperatura, fault codes), **teste de motor** (duty cycle, forward/reverse, freio regenerativo com auto-stop), **TCP Bridge** serial→TCP para uso simultâneo com VESC Tool, upload/visualização de arquivos XML de configuração do VESC, estimativa de bateria e gráficos Chart.js com histórico.
+
+As duas aplicações são independentes — podem rodar juntas ou separadas. O `gamepad_web_can_flipsky.py` (~7000 linhas) é um monolito Flask + Socket.IO com HTML/CSS/JS inline. O `vesc_read.py` (~1610 linhas) é Flask puro com REST API + template inline com Chart.js.
 
 ![Interface PandoraPi](assets/screenshot.png)
 
@@ -19,6 +25,8 @@ Todo o sistema roda como um único script Python (~7000 linhas) — Flask + Sock
 | Orbbec Astra Pro | Câmera 3D depth via USB. Captura 640×480 @ 30fps Y16. Wrapper ctypes em `ob_depth.py` sobre `libOrbbecSDK.so` (SDK incluso em `OrbbecSDK/lib/arm64/`). Colormap JET via OpenCV |
 
 ## Como funciona
+
+### gamepad_web_can_flipsky.py (porta 5005)
 
 ```
 Navegador (http://IP_DO_PI:5005)
@@ -51,6 +59,38 @@ Navegador (http://IP_DO_PI:5005)
 │  CAN / SocketCAN (PF_CAN)     │
 │  Envia quadros CAN estendidos │──► CANable ──► Flipsky VESC 1 + 2
 │  com duty cycle (-1.0 a 1.0)  │
+└───────────────────────────────┘
+```
+
+### vesc_read.py (porta 5008)
+
+```
+Navegador (http://IP_DO_PI:5008)
+        │
+        ▼ REST API (JSON)
+┌───────────────────────────────┐
+│         Flask Server          │
+│  - Rotas REST de telemetria   │
+│  - Template inline + Chart.js │
+├───────────────────────────────┤
+│  Thread: vesc_reader_loop     │
+│  VESC(serial_port=/dev/ttyACM0)│──► Flipsky VESC (USB Serial)
+│  get_measurements() a 4 Hz    │    (pyvesc protocol)
+│  Processa fault codes, calcula│
+│  potência, estima bateria     │
+├───────────────────────────────┤
+│  Motor Test (queue)           │
+│  set_duty_cycle / set_current │──► Flipsky VESC (USB Serial)
+│  forward/reverse/regen brake  │
+│  Auto-stop por tempo/fault    │
+├───────────────────────────────┤
+│  TCP Bridge (serial ↔ TCP)    │
+│  socket server na porta 65102 │──► VESC Tool (TCP)
+│  Bridge transparente          │
+├───────────────────────────────┤
+│  VESC XML Config              │
+│  Upload app/motor XML → parse │
+│  Visualização flat/compact    │
 └───────────────────────────────┘
 ```
 
@@ -231,19 +271,23 @@ sudo modprobe hid-nintendo
 
 | Pacote | Uso | Obrigatório |
 |---|---|---|
-| `flask` | Framework web | Sim |
-| `flask-socketio` | WebSocket / eventos em tempo real | Sim |
+| `flask` | Framework web (ambas as apps) | Sim |
+| `flask-socketio` | WebSocket / eventos em tempo real (gamepad app) | Sim (gamepad) |
 | `evdev` | Leitura de gamepad (`/dev/input/eventX`) | Sim (gamepad) |
 | `pyserial` | Comunicação serial (LiDAR + GPS A76XX) | Sim (LiDAR/GPS) |
+| `pyvesc` | Comunicação serial com VESC (vesc_read.py) | Sim (monitor VESC) |
 | `numpy` | Processamento de arrays (colormap depth) | Somente Depth Camera |
 | `opencv-python` | Colormap JET + compressão JPEG | Somente Depth Camera |
 
 ```bash
 # Instalação completa (todos os componentes)
-pip install flask flask-socketio evdev pyserial numpy opencv-python
+pip install flask flask-socketio evdev pyserial pyvesc numpy opencv-python
 
-# Instalação mínima (gamepad + CAN, sem LiDAR/GPS/Depth)
+# Instalação mínima (gamepad + CAN, sem LiDAR/GPS/Depth/VESC monitor)
 pip install flask flask-socketio evdev
+
+# Instalação mínima (monitor VESC standalone)
+pip install flask pyvesc
 ```
 
 > Cada componente é importado sob `try/except` — se faltar, o subsistema correspondente é desabilitado sem quebrar o resto. `pyserial` é necessário para LiDAR e GPS. `numpy` e `opencv-python` são necessários para a câmera depth (colormap + JPEG).
@@ -270,22 +314,102 @@ cam.close()
 
 > A câmera depth só funciona em **Raspberry Pi (aarch64/arm64)**. Em x86_64, `ob_depth.py` exibe um erro claro de arquitetura.
 
-## Como rodar
+## Monitor VESC / Teste de Motor (`vesc_read.py`)
+
+Aplicação web independente que conecta diretamente ao VESC via **serial USB** usando o protocolo `pyvesc`. Permite monitorar e testar o motor sem depender de CAN ou gamepad.
+
+### Funcionalidades
+
+| Funcionalidade | Descrição |
+|---|---|
+| **Telemetria em tempo real** | Tensão (V), corrente de entrada/motor (A), RPM, duty cycle (%), potência (W), temperatura FET/motor, consumo (Ah/Wh) |
+| **Fault codes** | Detecção automática de 19 fault codes com nome e ação de segurança (auto-stop) |
+| **Estimativa de bateria** | Calcula % da bateria baseado nos parâmetros de cutoff da config real do VESC |
+| **Teste de motor** | Controle de duty cycle com forward/reverse, freio regenerativo, auto-stop por tempo limite (10s) ou fault |
+| **TCP Bridge** | Ponte serial→TCP (porta 65102) para usar o VESC Tool simultaneamente com o monitor |
+| **XML Config** | Upload e visualização de arquivos XML de configuração do VESC (app_config.xml, motor_config.xml) |
+| **Histórico** | Deque dos últimos 600 pontos com gráficos Chart.js (tensão, corrente, RPM, duty, potência, temperatura) |
+
+### Como rodar
 
 ```bash
-# Dentro da pasta do projeto
-sudo python gamepad_web_can_flipsky.py
+# Porta serial padrão: /dev/ttyACM0 (configurável via VESC_PORT)
+python vesc_read.py
 ```
 
-> **Por que sudo?** O script precisa executar `ip link set can0 up type can bitrate 500000` para ativar a interface CAN **e** acessar a porta serial `/dev/ttyUSB0` do LiDAR. Se for usar apenas o gamepad sem CAN/LiDAR, pode rodar como usuário normal desde que esteja no grupo `input`:
+Acesse no navegador: **http://<IP_DO_RASPBERRY>:5008**
+
+### Variáveis de ambiente
+
+| Variável | Padrão | Descrição |
+|---|---|---|
+| `VESC_PORT` | `/dev/ttyACM0` | Porta serial do VESC |
+| `VESC_INTERVAL` | `0.25` | Intervalo de leitura (segundos) |
+| `VESC_HISTORY_LIMIT` | `600` | Pontos no histórico |
+| `VESC_TCP_PORT` | `65102` | Porta TCP da bridge |
+| `VESC_BAUD` | `115200` | Baud rate da serial (bridge) |
+| `VESC_TCP_BUFFER` | `4096` | Tamanho do buffer TCP |
+| `VESC_MOTOR_TEST_MAX_DUTY_PERCENT` | `8.0` | Duty máximo no teste de motor |
+| `VESC_MOTOR_TEST_DEFAULT_DUTY_PERCENT` | `1.0` | Duty inicial no teste |
+| `VESC_MOTOR_TEST_STEP_PERCENT` | `1.0` | Incremento/decremento do duty |
+| `VESC_MOTOR_TEST_MAX_DURATION_S` | `10.0` | Tempo máximo de teste contínuo |
+| `VESC_MOTOR_TEST_REGEN_BRAKE_CURRENT_A` | `2.0` | Corrente do freio regenerativo |
+| `VESC_MOTOR_TEST_REGEN_BRAKE_DURATION_S` | `2.0` | Duração do freio regenerativo |
+| `VESC_REAL_CONFIG_DIR` | `vesc_real_configs` | Pasta para XMLs de config |
+
+### Endpoints REST
+
+| Método | Rota | Descrição |
+|---|---|---|
+| `GET` | `/` | Interface web com gráficos e controle de motor |
+| `GET` | `/api/data` | Telemetria atual + estado + config real + bridge + motor test |
+| `GET` | `/api/history` | Histórico completo (deque dos últimos 600 pontos) |
+| `GET` | `/api/ports` | Portas seriais disponíveis no sistema |
+| `GET` | `/api/real-config` | Configuração XML carregada (app + motor) |
+| `POST` | `/api/real-config/upload` | Upload de XML (`type=app` ou `type=motor`) |
+| `GET` | `/api/motor-test` | Estado atual do teste de motor |
+| `POST` | `/api/motor-test/start` | Iniciar teste (`duty_percent`, `direction`) |
+| `POST` | `/api/motor-test/stop` | Parar teste |
+| `POST` | `/api/motor-test/set-duty` | Ajustar duty (`duty_percent`) |
+| `POST` | `/api/motor-test/step` | Incrementar/decrementar duty (`delta_percent`) |
+| `POST` | `/api/motor-test/direction` | Mudar direção (`direction`: forward/reverse) |
+| `POST` | `/api/motor-test/regen-brake` | Aplicar freio regenerativo (`current_a`) |
+| `GET` | `/api/tcp-bridge` | Estado da bridge TCP |
+| `POST` | `/api/tcp-bridge/start` | Iniciar bridge (`port`) |
+| `POST` | `/api/tcp-bridge/stop` | Parar bridge |
+
+### Segurança
+
+- **Auto-stop** por tempo: o teste de motor para automaticamente após `MOTOR_TEST_MAX_DURATION_S` (10s)
+- **Auto-stop** por fault: qualquer fault code ≠ 0 interrompe o motor imediatamente
+- **TCP Bridge** bloqueia teste de motor enquanto ativa (evita conflito com VESC Tool)
+- **Duty máximo** limitado a 8% por padrão (configurável via env)
+
+## Como rodar
+
+O projeto tem **duas aplicações independentes**. Rode uma ou ambas conforme necessário:
+
+```bash
+# Aplicação principal — gamepad + CAN + LiDAR + GPS + Depth + Follow
+sudo python gamepad_web_can_flipsky.py
+# Acesse: http://<IP_DO_RASPBERRY>:5005
+
+# Monitor VESC + Teste de motor (serial USB, não requer sudo)
+python vesc_read.py
+# Acesse: http://<IP_DO_RASPBERRY>:5008
+```
+
+> **Por que sudo?** O `gamepad_web_can_flipsky.py` precisa executar `ip link set can0 up type can bitrate 500000` para ativar a interface CAN **e** acessar a porta serial `/dev/ttyUSB0` do LiDAR. Se for usar apenas o gamepad sem CAN/LiDAR, pode rodar como usuário normal desde que esteja no grupo `input`:
 >
 > ```bash
 > sudo usermod -aG input $USER
 > sudo usermod -aG dialout $USER   # para acesso serial (LiDAR)
 > sudo reboot
 > ```
+>
+> O `vesc_read.py` roda como usuário normal, desde que esteja no grupo `dialout` para acesso à serial `/dev/ttyACM0`.
 
-Acesse no navegador: **http://<IP_DO_RASPBERRY>:5005**
+Acesse no navegador: **http://<IP_DO_RASPBERRY>:5005** (gamepad/CAN) e **http://<IP_DO_RASPBERRY>:5008** (monitor VESC).
 
 Na inicialização o script exibe no terminal todas as instruções de dependências, diagnóstico e comandos úteis.
 
@@ -618,17 +742,19 @@ sudo apt install python3-evdev
 
 ## Arquitetura do código
 
-O projeto é um **monolito de arquivo único** (~7000 linhas) + `ob_depth.py` (wrapper ctypes, ~160 linhas) contendo:
+O projeto consiste em **duas aplicações Flask independentes** mais `ob_depth.py` (wrapper ctypes, ~234 linhas):
 
 ```
 pandorapi/
-├── gamepad_web_can_flipsky.py   ← arquivo principal (~7000 linhas)
+├── gamepad_web_can_flipsky.py   ← app principal (~7000 linhas) — porta 5005
+├── vesc_read.py                  ← monitor VESC (~1610 linhas) — porta 5008
 ├── ob_depth.py                   ← wrapper ctypes p/ Orbbec Astra Pro
 ├── OrbbecSDK/                    ← SDK Orbbec (clonado, .gitignored)
 │   └── lib/arm64/*.so            ← bibliotecas nativas ARM
 ├── lib/arm64/                    ← backup das .so
 ├── assets/screenshot.png
 ├── README.md
+├── vesc_real_configs/            ← XMLs de config do VESC (criado em runtime)
 └── gamepad_config.json           ← config gerada automaticamente
 
 gamepad_web_can_flipsky.py
@@ -645,11 +771,22 @@ gamepad_web_can_flipsky.py
 ├── Bluetooth (bluetoothctl interativo via subprocess.Popen)
 ├── CAN / SocketCAN (PF_CAN socket, duty, current brake, quadros estendidos)
 ├── Lógica do robô (deadman, brake, throttle+steering→duty left/right)
-├── Rotas Flask (~45 endpoints REST + Socket.IO)
-└── Entry point (4 threads + socketio.run na porta 5005)
+├── Rotas Flask (~55 endpoints REST + Socket.IO)
+└── Entry point (5 threads + socketio.run na porta 5005)
+
+vesc_read.py
+├── Telemetria (pyvesc, VESC.get_measurements(), convert_measurements)
+├── Fault codes (19 códigos com nome + auto-stop)
+├── Teste de motor (command queue, duty/freio regenerativo, auto-stop)
+├── TCP Bridge (serial→TCP para VESC Tool, 2 threads bidirecionais)
+├── XML Config (parse de app_config.xml + motor_config.xml, flat/compact)
+├── Bateria (estimativa % via cutoff_start/end da config real)
+├── Histórico (deque maxlen=600, timestamp + time_label)
+├── Rotas Flask (~15 endpoints REST)
+└── Template inline com Chart.js (gráficos de tensão, corrente, RPM, duty, potência, temperatura)
 ```
 
-### Threads
+### Threads — gamepad_web_can_flipsky.py
 
 - **Main thread**: servidor Flask + Socket.IO
 - **gamepad_reader_loop** (daemon): loop infinito lendo eventos do `/dev/input/eventX`, reconectando automaticamente se o dispositivo sumir
@@ -657,15 +794,29 @@ gamepad_web_can_flipsky.py
 - **depth_camera_loop** (daemon): abre câmera depth via `ob_depth.py` (ctypes), captura frames 640×480 Y16, aplica colormap JET via OpenCV, comprime JPEG e emite via Socket.IO a ~10 fps
 - **lidar_reader_loop** (daemon): abre porta serial, faz parsing do protocolo LDROBOT, acumula pontos por ângulo (deduplicação por confiança), emite frames a cada ~80ms e alimenta o obstacle avoidance do follow
 
+### Threads — vesc_read.py
+
+- **Main thread**: servidor Flask
+- **vesc_reader_loop** (daemon): loop infinito lendo telemetria do VESC via serial USB com pyvesc, processa comandos de motor test, mantém auto-stop por tempo/fault, escreve no deque de histórico
+- **TCP Bridge threads** (2 daemon, sob demanda): `bridge_socket_to_serial` e `bridge_serial_to_socket` — ponte bidirecional serial↔TCP para uso simultâneo com VESC Tool
+
 ### Comunicação
 
+**gamepad_web_can_flipsky.py:**
+
 - **Browser ↔ Servidor**: Socket.IO para eventos em tempo real (status do gamepad, status CAN, eventos de botão/eixo, status GPS, pontos de trajeto, nuvem de pontos LiDAR, frame depth, follow status)
-- **Browser ↔ Servidor**: REST API (~45 endpoints) para configuração, Bluetooth, CAN, LiDAR, GPS, trajeto, follow, depth camera
+- **Browser ↔ Servidor**: REST API (~55 endpoints) para configuração, Bluetooth, CAN, LiDAR, GPS, trajeto, follow, depth camera
 - **Servidor ↔ CAN bus**: socket `PF_CAN` raw — `CAN_PACKET_SET_DUTY` (ID 0), `CAN_PACKET_SET_CURRENT_BRAKE` (ID 2), quadros CAN estendidos (29-bit ID)
 - **Servidor ↔ Bluetooth**: `subprocess.Popen` com `bluetoothctl` em modo interativo (stdin/stdout)
 - **Servidor ↔ LiDAR**: `pyserial` na porta `/dev/ttyUSB0` a 230400 baud
 - **Servidor ↔ Modem A76XX**: `pyserial` na porta `/dev/ttyUSB1` a 115200 baud (AT commands + streaming GPS)
 - **Servidor ↔ Depth Camera**: `ob_depth.py` (ctypes) → `libOrbbecSDK.so` via USB
+
+**vesc_read.py:**
+
+- **Browser ↔ Servidor**: REST API (~15 endpoints) para telemetria, motor test, TCP bridge, config XML
+- **Servidor ↔ VESC**: `pyvesc` via serial USB (`/dev/ttyACM0`) — protocolo VESC (get_measurements, set_duty_cycle, set_current, set_current_brake, get_firmware_version)
+- **TCP Bridge**: `socket.socket` (AF_INET, SOCK_STREAM) — ponte transparente serial↔TCP na porta 65102 para VESC Tool
 
 ### Formato do quadro CAN
 

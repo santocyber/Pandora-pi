@@ -6,3 +6,5 @@ gamepad_config.json
 .env
 OrbbecSDK/
 lib/arm64/
+vesc_tool_free_linux/
+vesc_real_configs/
