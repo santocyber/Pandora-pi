@@ -60,7 +60,7 @@ MOTOR_TEST_REGEN_BRAKE_DURATION_S = float(os.getenv("VESC_MOTOR_TEST_REGEN_BRAKE
 
 app = Flask(__name__)
 
-lock = threading.Lock()
+lock = threading.RLock()
 
 state = {
     "connected": False,
@@ -740,7 +740,6 @@ def get_active_vesc_port():
 
 def get_serial_port_state():
     ports = list_serial_ports()
-
     active = get_active_vesc_port()
 
     with lock:
@@ -753,6 +752,7 @@ def get_serial_port_state():
         "auto": selected.get("auto", True),
         "last_scan": selected.get("last_scan"),
         "last_error": selected.get("last_error"),
+        "count": len(ports),
     }
 
 def get_tcp_bridge_state():
@@ -1600,16 +1600,23 @@ def index():
 def api_data():
     with lock:
         data = latest_data.copy()
+        state_snapshot = state.copy()
+        tcp_bridge_snapshot = tcp_bridge_state.copy()
+        motor_test_snapshot = motor_test_state.copy()
 
-        return jsonify({
-            "state": state.copy(),
-            "data": data,
-            "ports": list_serial_ports(),
-            "serial": get_serial_port_state(),
-            "real_config": load_real_vesc_configs(),
-            "tcp_bridge": tcp_bridge_state.copy(),
-            "motor_test": motor_test_state.copy(),
-        })
+    ports = list_serial_ports()
+    serial_state = get_serial_port_state()
+    real_config = load_real_vesc_configs()
+
+    return jsonify({
+        "state": state_snapshot,
+        "data": data,
+        "ports": ports,
+        "serial": serial_state,
+        "real_config": real_config,
+        "tcp_bridge": tcp_bridge_snapshot,
+        "motor_test": motor_test_snapshot,
+    })
 
 
 @app.route("/api/history")
@@ -1626,6 +1633,16 @@ def api_ports():
     return jsonify({
         "ok": True,
         "serial": get_serial_port_state(),
+    })
+
+
+@app.route("/api/health", methods=["GET"])
+def api_health():
+    return jsonify({
+        "ok": True,
+        "state": state.copy(),
+        "serial": get_serial_port_state(),
+        "ports": list_serial_ports(),
     })
 
 
@@ -1969,7 +1986,7 @@ TEMPLATE = r"""
         <div>
             <span class="navbar-brand mb-0 h1">Monitor VESC / Flipsky 75100</span>
             <span class="badge badge-soft">porta Flask {{ app_port }}</span>
-            <span class="badge badge-soft">serial {{ vesc_port }}</span>
+            <span id="navbarSerialBadge" class="badge badge-soft">serial {{ vesc_port }}</span>
         </div>
 
         <div class="d-flex align-items-center">
@@ -2553,11 +2570,15 @@ function setText(id, value) {
 function updateSerialPortBox(serial) {
     if (!serial) return;
 
+    const ports = serial.ports || [];
+
+    setText("portsList", ports.length ? ports.join(" | ") : "--");
+    setText("navbarSerialBadge", "serial " + (serial.selected || "--"));
+
     const select = document.getElementById("serialPortSelect");
 
     if (select) {
         const selectedBefore = select.value;
-        const ports = serial.ports || [];
 
         select.innerHTML = "";
 
@@ -2604,8 +2625,12 @@ async function loadSerialPorts() {
         const res = await fetch("/api/serial-port", { cache: "no-store" });
         const payload = await res.json();
 
-        if (payload.ok) {
+        if (payload.serial) {
             updateSerialPortBox(payload.serial);
+        }
+
+        if (!payload.ok && payload.message) {
+            setText("serialPortMessage", payload.message);
         }
     } catch (e) {
         setText("serialPortMessage", "Erro ao listar portas: " + String(e));
@@ -3127,9 +3152,27 @@ async function stopTcpBridge() {
 }
 
 function createLineChart(canvasId, labels) {
-    const ctx = document.getElementById(canvasId);
+    const canvas = document.getElementById(canvasId);
 
-    return new Chart(ctx, {
+    if (!canvas || typeof Chart === "undefined") {
+        if (typeof Chart === "undefined") {
+            console.warn("Chart.js não carregou. Os gráficos serão desativados, mas a telemetria continua.");
+        }
+
+        return {
+            disabled: true,
+            data: {
+                labels: [],
+                datasets: labels.map(label => ({
+                    label: label,
+                    data: []
+                }))
+            },
+            update: function() {}
+        };
+    }
+
+    return new Chart(canvas, {
         type: "line",
         data: {
             labels: [],
@@ -3185,10 +3228,14 @@ const chartCurrent = createLineChart("chartCurrent", ["Corrente motor", "Corrent
 const chartTemp = createLineChart("chartTemp", ["Temp FET", "Temp motor"]);
 
 function pushChart(chart, label, values) {
+    if (!chart || !chart.data || !chart.data.datasets) return;
+
     chart.data.labels.push(label);
 
     values.forEach((value, idx) => {
-        chart.data.datasets[idx].data.push(value);
+        if (chart.data.datasets[idx]) {
+            chart.data.datasets[idx].data.push(value);
+        }
     });
 
     while (chart.data.labels.length > maxPoints) {
@@ -3196,7 +3243,9 @@ function pushChart(chart, label, values) {
         chart.data.datasets.forEach(ds => ds.data.shift());
     }
 
-    chart.update("none");
+    if (!chart.disabled && typeof chart.update === "function") {
+        chart.update("none");
+    }
 }
 
 function updateStatus(state, ports) {
@@ -3299,6 +3348,11 @@ function updateCharts(data) {
 async function loadData() {
     try {
         const res = await fetch("/api/data", { cache: "no-store" });
+
+        if (!res.ok) {
+            throw new Error("HTTP " + res.status);
+        }
+
         const payload = await res.json();
 
         updateStatus(payload.state, payload.ports);
