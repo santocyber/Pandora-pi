@@ -1,9 +1,15 @@
-# PandoraPi — Gamepad Bluetooth + CAN Flipsky + Monitor VESC + LiDAR + GPS A76XX + Depth Camera + Follow Autonomo
+# PandoraPi — Gamepad Bluetooth + CAN Flipsky + Monitor VESC + LiDAR + GPS A76XX + Depth Camera + Follow Autonomo + Painel CAN + Radar LiDAR + Camera 3D
 
-Tres aplicacoes web que transformam um Raspberry Pi em uma central de controle para robos com tracao diferencial usando controladores **Flipsky 75100 (VESC)** conectados via barramento **CAN** e/ou serial USB.
+Seis aplicacoes web que transformam um Raspberry Pi em uma central de controle para robos com tracao diferencial usando controladores **Flipsky 75100 (VESC)** conectados via barramento **CAN** e/ou serial USB.
 
 ### `gamepad_web_can_flipsky.py` (porta 5005)
 Controle via **gamepad Bluetooth HID** (Nintendo Switch Pro Controller ou qualquer controle compativel com evdev). **LiDAR LDROBOT STL-06P** integrado como radar de navegacao com nuvem de pontos 2D persistente (time-decay de 3 segundos). **GPS via modem SIMCom A76XX LTE** com visualizacao em mapa Leaflet, constelacao de satelites em canvas, gravacao de trajeto com exportacao GPX/JSON, upload de rota GPX e navegacao autonoma (follow) com desvio de obstaculos via LiDAR. **Depth Camera Orbbec Astra Pro** com streaming de profundidade colorizada (colormap JET) via `ob_depth.py` (wrapper ctypes). **Freio regenerativo** no botao B (`CAN_PACKET_SET_CURRENT_BRAKE`, 8A configuravel).
+
+### `can_setup.py` (porta 5006)
+Painel visual para configuracao do barramento **CAN via SLCAN/SocketCAN**. Suporte a adaptadores CANable com firmware candleLight ou SLCAN. Lista dispositivos seriais, ativa interface CAN via `slcand`, envia/recebe frames CAN, monitor de trafego com **Server-Sent Events** (candump em tempo real). Interface Bootstrap 5 escura com tabela de comandos uteis.
+
+### `3dcam.py` (porta 5007)
+Painel dedicado para a **Orbbec Astra Pro** — streaming MJPEG de **RGB** (via OpenCV V4L2) e **depth colorizado** (via OrbbecSDK v1 bridge em subprocesso). Overlay de distancias (grid configuravel, centro com mediana), legendas de cores (TURBO/JET/VIRIDIS/PLASMA/MAGMA/BONE), correcoes USB automaticas, reinicio limpo do sensor depth via unbind/bind. Escala ajustavel, suavizacao, marcacao de areas sem leitura.
 
 ### `vesc_read.py` (porta 5008)
 Monitor direto do VESC com pyvesc via **serial USB** — telemetria em tempo real (tensao, corrente, RPM, duty cycle, potencia, temperatura, fault codes), **teste de motor** (duty cycle, forward/reverse, freio regenerativo com auto-stop), **TCP Bridge** serial→TCP para uso simultaneo com VESC Tool, upload/visualizacao de arquivos XML de configuracao do VESC, estimativa de bateria, historico de telemetria e graficos Chart.js.
@@ -11,7 +17,8 @@ Monitor direto do VESC com pyvesc via **serial USB** — telemetria em tempo rea
 ### `vesc_controller.py` (porta 5009)
 Controlador simplificado e modular com suporte a **gamepad Bluetooth HID (evdev)** ou **teclado**. Opera em dois modos: **serial** (1 VESC via USB com telemetria pyvesc) ou **CAN** (2 ou 4 VESCs via CANable com SocketCAN). Streaming de **webcam USB (OpenCV)** com gravacao MP4. Toda configuracao via variaveis de ambiente — sem arquivo JSON de config. Ideal para setups rapidos e depuracao.
 
-As tres aplicacoes sao independentes — podem rodar juntas ou separadas. O `gamepad_web_can_flipsky.py` (~7061 linhas) e um monolito Flask + Socket.IO com HTML/CSS/JS inline, completo com todos os perifericos. O `vesc_read.py` (~3440 linhas) e Flask puro com REST API + template inline com Chart.js. O `vesc_controller.py` (~1966 linhas) e Flask + Socket.IO com foco em simplicidade e controle essencial.
+### `lidar.py` (porta 5010)
+Radar visual para o **LiDAR LDROBOT STL-06P** — nuvem de pontos 2D em canvas com sweep animado, aneis de alcance (bands coloridas), deteccao de objetos agrupados por proximidade (cluster), marcadores de ponto mais proximo/longe, regua de escala, **preview 3D** via Three.js com OrbitControls (girar, zoom, pan). Exportacao completa nos formatos **PNG, JSON, CSV e PLY** com coordenadas em metros, cores por distancia e confianca.
 
 ![Interface PandoraPi](assets/screenshot.png)
 
@@ -127,6 +134,88 @@ Navegador (http://IP_DO_PI:5009)
 │  CAN / SocketCAN (PF_CAN)     │
 │  Envia quadros CAN estendidos │──► CANable ──► 2-4 Flipsky VESC
 │  com duty cycle (-1.0 a 1.0)  │
+└───────────────────────────────┘
+```
+
+### can_setup.py (porta 5006)
+
+```
+Navegador (http://IP_DO_PI:5006)
+        │
+        ▼ REST API + SSE
+┌───────────────────────────────┐
+│         Flask Server          │
+│  - Rotas REST de config CAN   │
+│  - SSE para candump ao vivo   │
+├───────────────────────────────┤
+│  subprocess: slcand, cansend  │
+│  subprocess: ip link, modprobe│
+│  subprocess: candump (SSE)    │──► CANable / SLCAN
+├───────────────────────────────┤
+│  Lista dispositivos seriais   │
+│  /dev/serial/by-id/*          │
+│  /dev/ttyACM*, /dev/ttyUSB*   │
+└───────────────────────────────┘
+```
+
+### 3dcam.py (porta 5007)
+
+```
+Navegador (http://IP_DO_PI:5007)
+        │
+        ▼ MJPEG (multipart/x-mixed-replace) + REST
+┌───────────────────────────────┐
+│         Flask Server          │
+│  - /video/rgb  (MJPEG stream) │
+│  - /video/depth (MJPEG stream)│
+│  - REST API de controle       │
+├───────────────────────────────┤
+│  Thread: rgb_worker           │
+│  OpenCV V4L2 /dev/video2      │──► Orbbec Astra Pro (RGB)
+│  MJPG fourcc, mirror, JPEG    │
+├───────────────────────────────┤
+│  OrbbecSDK v1 Bridge          │
+│  Subprocesso C++ nativo       │──► Orbbec Astra Pro (Depth)
+│  Escreve /tmp/orbbec_depth.raw│    Y16 640×480 via USB
+│  + /tmp/orbbec_depth_meta.json│
+├───────────────────────────────┤
+│  Thread: depth_worker         │
+│  Le raw → numpy uint16        │
+│  Colormap (TURBO/JET/etc)     │
+│  Overlay distancias + legendas│
+│  MJPEG stream                  │
+├───────────────────────────────┤
+│  Correcoes USB                │
+│  autosuspend, usbfs_memory_mb │
+│  unbind/bind 2bc5:0403        │
+└───────────────────────────────┘
+```
+
+### lidar.py (porta 5010)
+
+```
+Navegador (http://IP_DO_PI:5010)
+        │
+        ▼ REST API + Three.js CDN
+┌───────────────────────────────┐
+│         Flask Server          │
+│  - /api/points (GET JSON)     │
+│  - Template inline completo   │
+├───────────────────────────────┤
+│  Thread: serial_worker        │
+│  pyserial /dev/ttyUSB0        │──► LiDAR LDROBOT STL-06P
+│  230400 baud, protocolo 0x54  │    (USB serial)
+│  Parse 47-byte frames, CRC    │
+├───────────────────────────────┤
+│  Frontend Canvas 2D           │
+│  Nuvem pontos + sweep + grid  │
+│  Deteccao objetos (cluster)   │
+│  Marcadores perto/longe       │
+├───────────────────────────────┤
+│  Frontend Three.js 3D         │
+│  Preview 3D com OrbitControls │
+│  Esferas extremos, grid, eixos│
+│  Export PNG/JSON/CSV/PLY      │
 └───────────────────────────────┘
 ```
 
@@ -308,11 +397,12 @@ Funcoes disponiveis: **Iniciar**, **Pausar**, **Retomar**, **Parar**. O download
 | `joystick` | Utilitarios de joystick | Recomendado |
 | `usbutils` | `lsusb` (depuracao USB) | Recomendado |
 | `libusb-1.0-0` | Dependencia nativa do Orbbec SDK (`libob_usb.so`) | Somente Depth Camera |
+| `v4l-utils` | `v4l2-ctl --list-devices` (deteccao de cameras RGB) | Somente 3dcam.py |
 
 ```bash
 # Instalacao completa (todos os componentes)
 sudo apt install -y python3 python3-pip bluetooth bluez kmod iproute2 sudo \
-  can-utils evtest joystick usbutils libusb-1.0-0
+  can-utils evtest joystick usbutils libusb-1.0-0 v4l-utils
 
 # Instalacao minima (gamepad + CAN, sem perifericos)
 sudo apt install -y python3 python3-pip bluetooth bluez kmod iproute2 sudo
@@ -557,14 +647,167 @@ Acesse no navegador: **http://<IP_DO_RASPBERRY>:5008**
 - **TCP Bridge** bloqueia teste de motor enquanto ativa (evita conflito com VESC Tool)
 - **Duty maximo** limitado a 8% por padrao (configuravel via env)
 
+## Painel CAN (`can_setup.py`) — porta 5006
+
+Aplicacao web independente para configuracao visual do barramento CAN. Suporta adaptadores CANable com firmware candleLight ou SLCAN via `slcand`. Nao depende de VESC — funciona como ferramenta de diagnostico CAN standalone.
+
+### Funcionalidades
+
+| Funcionalidade | Descricao |
+|---|---|
+| **Listar dispositivos seriais** | Detecta `/dev/serial/by-id/*`, `/dev/ttyACM*`, `/dev/ttyUSB*` |
+| **Subir CAN via SLCAN** | `slcand -o -c -f -sN <port> <iface>` + `ip link set up` |
+| **Parar CAN** | `ip link set down` + `pkill slcand` |
+| **Enviar frame CAN** | `cansend <iface> <ID>#<HEX_DATA>`, com validacao de ID e dados |
+| **Monitor CAN (SSE)** | Server-Sent Events com `candump -tz` em tempo real |
+| **Status detalhado** | `ip -details -statistics link show`, estado UP/DOWN/inexistente |
+| **Tabela de comandos** | Referencia rapida: `candump`, `cansend`, `slcand`, `ip link` |
+
+### Como rodar
+
+```bash
+# Nao requer sudo — usa comandos do sistema para CAN
+python can_setup.py
+```
+
+Acesse no navegador: **http://<IP_DO_RASPBERRY>:5006**
+
+### Endpoints REST
+
+| Metodo | Rota | Descricao |
+|---|---|---|
+| `GET` | `/` | Interface web Bootstrap 5 escura |
+| `GET` | `/api/devices` | Listar portas seriais disponiveis |
+| `GET` | `/api/status?iface=can0` | Status da interface CAN (exists, up, output) |
+| `POST` | `/api/start_slcan` | Subir CAN via SLCAN (`port`, `iface`, `bitrate`) |
+| `POST` | `/api/stop` | Parar interface CAN (`iface`) |
+| `POST` | `/api/send` | Enviar frame CAN (`iface`, `can_id`, `data`) |
+| `GET` | `/api/monitor?iface=can0` | SSE stream do candump em tempo real |
+| `POST` | `/api/monitor_stop` | Parar monitor SSE |
+
+### Seguranca
+
+- Validacao rigorosa de nome de interface (regex `[a-zA-Z0-9_.:-]{1,32}`)
+- Validacao de ID CAN (HEX 1-8 chars) e dados (HEX ate 8 bytes)
+- Executa comandos do sistema — rode apenas em rede confiavel
+
+---
+
+## Painel Camera 3D (`3dcam.py`) — porta 5007
+
+Aplicacao web dedicada para a **Orbbec Astra Pro** com streaming MJPEG de RGB e depth colorizado. Usa o OrbbecSDK v1 bridge (subprocesso C++ nativo) para captura de profundidade Y16 com overlay de distancias em tempo real.
+
+### Funcionalidades
+
+| Funcionalidade | Descricao |
+|---|---|
+| **RGB via OpenCV V4L2** | Streaming MJPEG (`multipart/x-mixed-replace`) com deteccao automatica da Astra Pro HD Camera |
+| **Depth via OrbbecSDK v1** | Bridge C++ nativo escreve raw em `/tmp/`. Leitura numpy uint16 com reconexao automatica |
+| **Colormap configurável** | TURBO (padrao), JET, VIRIDIS, PLASMA, MAGMA, BONE |
+| **Overlay de distancias** | Grid configuravel (1-8), mediana por raio de amostra, centro com crosshair, legenda de cores |
+| **Correcoes USB** | autosuspend=-1, usbfs_memory_mb=1000, power/control=on para dispositivos Orbbec (2bc5) |
+| **Reinicio limpo do depth** | unbind/bind do dispositivo USB 2bc5:0403, limpeza de `/tmp/`, restart do bridge |
+| **Suavizacao** | Median blur 3×3 nas areas sem leitura, contornos "sem leitura" marcados |
+| **Interface Bootstrap 5** | Tema escuro GitHub-style, previews lado a lado, todos os controles no painel esquerdo |
+
+### Como rodar
+
+```bash
+# Requer sudo para correcoes USB (autosuspend, usbfs_memory_mb, unbind/bind)
+sudo python 3dcam.py
+```
+
+Acesse no navegador: **http://<IP_DO_RASPBERRY>:5007**
+
+### Endpoints REST
+
+| Metodo | Rota | Descricao |
+|---|---|---|
+| `GET` | `/` | Interface web com previews lado a lado |
+| `GET` | `/api/devices` | Listar dispositivos V4L2 (`v4l2-ctl --list-devices`) |
+| `GET` | `/api/status` | Status completo (RGB, bridge, depth, config, logs) |
+| `GET` | `/api/depth_stats` | Estatisticas do frame depth atual (min, max, mediana, centro) |
+| `POST` | `/api/start` | Iniciar camera (aplica USB fix, inicia bridge, abre RGB) |
+| `POST` | `/api/stop` | Parar camera (libera RGB, mata bridge) |
+| `POST` | `/api/usb_fix` | Aplicar correcoes USB sem reiniciar camera |
+| `POST` | `/api/restart_depth_clean` | Reinicio completo do depth (USB reset + bridge limpo) |
+| `GET` | `/video/rgb` | Stream MJPEG do RGB |
+| `GET` | `/video/depth` | Stream MJPEG do depth colorizado com overlay |
+
+### Seguranca
+
+- Bridge C++ reiniciado automaticamente se detectado como morto
+- Grace period de 90s para primeiro frame do bridge
+- Cooldown de 25s entre tentativas de restart
+- Fallback para `/dev/video2`, `/dev/video1`, `/dev/video0` se camera principal falhar
+
+---
+
+## Radar LiDAR (`lidar.py`) — porta 5010
+
+Aplicacao web standalone para visualizacao do **LiDAR LDROBOT STL-06P** como radar 2D colorido com preview 3D interativo via Three.js. Nuvem de pontos persistente, deteccao de objetos por cluster, exportacao multi-formato.
+
+### Funcionalidades
+
+| Funcionalidade | Descricao |
+|---|---|
+| **Radar 2D Canvas** | Nuvem de pontos coloridos por distancia (7 faixas), sweep animado, grid polar com aneis de alcance |
+| **Preview 3D Three.js** | Nuvem 3D interativa com OrbitControls (girar, zoom, pan), grid, eixos XYZ, esferas de extremos |
+| **Deteccao de objetos** | Agrupamento por cluster (sensibilidade ajustavel 100-1000mm), labels numerados com distancia e angulo |
+| **Pontos extremos** | Marcadores visuais e cards para ponto mais proximo (vermelho) e mais longe (roxo) |
+| **Controles ajustaveis** | Alcance maximo (500-12000mm), offset angular (-180° a +180°), tamanho dos pontos, intensidade (trail alpha) |
+| **Exportacao** | **PNG** (canvas visual), **JSON** (completo com UI settings), **CSV** (coordenadas + cores), **PLY** (nuvem 3D com cores) |
+| **Protocolo LDROBOT** | Frames de 47 bytes, CRC XOR, 12 pontos por frame, 230400 baud |
+| **Interface responsiva** | Painel esquerdo com todos os controles, preview 3D no canto direito, tema escuro |
+
+### Como rodar
+
+```bash
+# Porta serial padrao: /dev/ttyUSB0, baud 230400
+python lidar.py
+
+# Com porta e host personalizados
+python lidar.py --port /dev/ttyACM0 --baud 230400 --host 0.0.0.0 --flask-port 5010
+```
+
+Acesse no navegador: **http://<IP_DO_RASPBERRY>:5010**
+
+### Endpoints REST
+
+| Metodo | Rota | Descricao |
+|---|---|---|
+| `GET` | `/` | Interface web completa com canvas 2D + preview 3D |
+| `GET` | `/api/points` | Nuvem de pontos atual + status (bytes, frames, scan Hz, idade) |
+
+### Exportacao
+
+Todos os formatos usam os pontos visiveis dentro do alcance configurado:
+
+| Formato | Extensao | Conteudo |
+|---|---|---|
+| **PNG** | `.png` | Screenshot do canvas (imagem visual) |
+| **JSON** | `.json` | Completo: pontos (x/y/z em metros, cores RGB, confianca), objetos detectados, UI settings, extremos |
+| **CSV** | `.csv` | Tabela: index, angulo, distancia (mm/m), coordenadas (m), cores RGB |
+| **PLY** | `.ply` | Nuvem 2D: vertex com x, y, z=0, cores, distancia, angulo, confianca. Abre no MeshLab/CloudCompare/Blender |
+
+---
+
 ## Como rodar
 
-O projeto tem **tres aplicacoes independentes**. Rode uma ou mais conforme necessario:
+O projeto tem **seis aplicacoes independentes**. Rode uma ou mais conforme necessario:
 
 ```bash
 # Aplicacao principal — gamepad + CAN + LiDAR + GPS + Depth + Follow
 sudo python gamepad_web_can_flipsky.py
 # Acesse: http://<IP_DO_RASPBERRY>:5005
+
+# Painel CAN — configuracao visual do barramento CAN
+python can_setup.py
+# Acesse: http://<IP_DO_RASPBERRY>:5006
+
+# Camera 3D — Orbbec Astra Pro RGB + Depth com overlay de distancias
+sudo python 3dcam.py
+# Acesse: http://<IP_DO_RASPBERRY>:5007
 
 # Monitor VESC + Teste de motor (serial USB, nao requer sudo)
 python vesc_read.py
@@ -573,9 +816,13 @@ python vesc_read.py
 # Controller simplificado — gamepad/teclado + serial/CAN + webcam
 python vesc_controller.py
 # Acesse: http://<IP_DO_RASPBERRY>:5009
+
+# Radar LiDAR — STL-06P com preview 3D e exportacao
+python lidar.py
+# Acesse: http://<IP_DO_RASPBERRY>:5010
 ```
 
-> **Por que sudo?** O `gamepad_web_can_flipsky.py` precisa executar `ip link set can0 up type can bitrate 500000` para ativar a interface CAN **e** acessar a porta serial `/dev/ttyUSB0` do LiDAR. Se for usar apenas o gamepad sem CAN/LiDAR, pode rodar como usuario normal desde que esteja no grupo `input`:
+> **Por que sudo?** O `gamepad_web_can_flipsky.py` e o `3dcam.py` precisam executar `ip link set can0 up type can bitrate 500000` para ativar a interface CAN **e** acessar a porta serial `/dev/ttyUSB0` do LiDAR / aplicar correcoes USB (autosuspend, usbfs_memory_mb) para a depth camera. Se for usar apenas o gamepad sem CAN/LiDAR, pode rodar como usuario normal desde que esteja no grupo `input`:
 >
 > ```bash
 > sudo usermod -aG input $USER
@@ -583,9 +830,9 @@ python vesc_controller.py
 > sudo reboot
 > ```
 >
-> O `vesc_read.py` e `vesc_controller.py` rodam como usuario normal, desde que esteja no grupo `dialout` para acesso a serial `/dev/ttyACM0`. Para modo CAN no `vesc_controller.py`, `sudo` e necessario para `ip link`.
+> O `can_setup.py`, `vesc_read.py`, `vesc_controller.py` e `lidar.py` rodam como usuario normal, desde que esteja no grupo `dialout` para acesso a serial `/dev/ttyACM0` ou `/dev/ttyUSB0`. Para modo CAN no `vesc_controller.py`, `sudo` e necessario para `ip link`.
 
-Acesse no navegador: **http://<IP_DO_RASPBERRY>:5005** (gamepad/CAN), **http://<IP_DO_RASPBERRY>:5008** (monitor VESC) e **http://<IP_DO_RASPBERRY>:5009** (controller simplificado).
+Acesse no navegador: **http://<IP_DO_RASPBERRY>:5005** (gamepad/CAN), **http://<IP_DO_RASPBERRY>:5006** (painel CAN), **http://<IP_DO_RASPBERRY>:5007** (camera 3D), **http://<IP_DO_RASPBERRY>:5008** (monitor VESC), **http://<IP_DO_RASPBERRY>:5009** (controller simplificado) e **http://<IP_DO_RASPBERRY>:5010** (radar LiDAR).
 
 Na inicializacao cada script exibe no terminal as instrucoes de dependencias, diagnostico e comandos uteis.
 
@@ -715,6 +962,40 @@ Na inicializacao cada script exibe no terminal as instrucoes de dependencias, di
 | **Telemetria VESC** | Grid 3×3 com tensao, corrente entrada, corrente motor, RPM, duty (%), potencia (W), temp FET, temp motor, fault. Barras de duty por motor (2 ou 4 motores) |
 | **Gamepad** | Selecao de dispositivo HID. Sticks visuais (esquerdo/direito) com indicador de posicao. Barras de throttle e steering. Indicador homem-morto |
 | **Controle** | Seletor de modo (serial/CAN), config de porta serial ou parametros CAN (interface, bitrate, IDs, nº motores). Botoes ARMAR/DESARMAR/PARADA DE EMERGENCIA |
+
+### can_setup.py (porta 5006)
+
+| Secao | Funcao |
+|---|---|
+| **Configuracao SLCAN** | Dropdown de dispositivos seriais (by-id, ttyACM, ttyUSB), nome da interface CAN, seletor de bitrate (125k–1M). Botoes Subir CAN / Parar CAN |
+| **Enviar frame CAN** | Inputs para ID (HEX) e dados (HEX), botao Enviar com feedback no monitor |
+| **Monitor CAN** | SSE stream do `candump -tz` em tempo real. Botoes Iniciar/Parar/Limpar |
+| **Status detalhado** | Pre com saida de `ip -details -statistics link show`. Badge de status (UP/DOWN/inexistente) |
+| **Tabela de comandos** | Referencia rapida: `ip link`, `candump`, `cansend`, `slcand` |
+
+### 3dcam.py (porta 5007)
+
+| Secao | Funcao |
+|---|---|
+| **Controles** | Dropdown de camera RGB com `v4l2-ctl --list-devices`, resolucao e FPS, JPEG quality, range de profundidade (near/far mm) |
+| **Depth / distancia** | Escala do preview, grade de distancias, raio de amostra, mapa de cor (6 opcoes), direcao da cor (perto quente/frio) |
+| **Opcoes visuais** | Mirror RGB/Depth, labels de distancia, suavizacao (median blur), legenda de cores, contornos de areas sem leitura, modo cinza |
+| **Preview RGB** | Stream MJPEG da camera RGB (lado esquerdo) |
+| **Preview Depth** | Stream MJPEG do depth colorizado com overlay de distancias, crosshair no centro, legendas (lado direito) |
+| **Status** | Pre com estado completo: bridge PID/runtime, raw/meta age/size, ultimos erros, tail do log do bridge (8KB) |
+| **Botoes de acao** | Iniciar camera, Parar camera, Aplicar correcao USB, Reiniciar depth limpo, Atualizar status |
+
+### lidar.py (porta 5010)
+
+| Secao | Funcao |
+|---|---|
+| **Status do LiDAR** | Serial (conectada/desconectada), bytes recebidos, pacotes validos/invalidos, pontos atuais, objetos detectados, rotacao Hz, idade do ultimo pacote |
+| **Pontos extremos** | Cards para ponto mais proximo (vermelho) e mais longe (roxo) com distancia formatada, angulo e confianca |
+| **Controles ajustaveis** | Alcance maximo (500-12000mm), offset angular (-180° a +180°), tamanho dos pontos (1-9px), intensidade visual (0.04-0.50), checkboxes para regua/objetos/linhas |
+| **Deteccao de objetos** | Maximo de objetos marcados (5-80), sensibilidade de agrupamento (100-1000mm) |
+| **Exportacao** | Botoes PNG, JSON, CSV, PLY com download automatico (timestamp no nome do arquivo) |
+| **Legenda de distancia** | 7 faixas de cor: 0-0.5m (vermelho), 0.5-1m (laranja), 1-2m (amarelo), 2-4m (verde), 4-6m (ciano), 6-8m (azul), >8m (roxo) |
+| **Preview 3D** | Three.js com OrbitControls. Esferas de extremos (vermelha/roxa), grid 16m, eixos XYZ. 10 botoes de camera predefinida (topo/lateral/frente/traseira/esquerda/direita/isometrica/1ª pessoa/ver perto/ver longe/reset). Tamanho 3D dos pontos e altura visual Z ajustaveis |
 
 ## Configuracao
 
@@ -976,13 +1257,16 @@ sudo apt install python3-evdev
 
 ## Arquitetura do codigo
 
-O projeto consiste em **tres aplicacoes Flask independentes** mais `ob_depth.py` (wrapper ctypes, ~234 linhas) e arquivos de suporte:
+O projeto consiste em **seis aplicacoes Flask independentes** mais `ob_depth.py` (wrapper ctypes, ~234 linhas) e arquivos de suporte:
 
 ```
 pandorapi/
 ├── gamepad_web_can_flipsky.py   ← app principal (~7061 linhas) — porta 5005
+├── can_setup.py                  ← painel CAN (~725 linhas) — porta 5006
+├── 3dcam.py                      ← camera 3D Astra Pro (~2042 linhas) — porta 5007
 ├── vesc_read.py                  ← monitor VESC (~3440 linhas) — porta 5008
 ├── vesc_controller.py            ← controller simplificado (~1966 linhas) — porta 5009
+├── lidar.py                      ← radar LiDAR STL-06P (~2482 linhas) — porta 5010
 ├── ob_depth.py                   ← wrapper ctypes p/ Orbbec Astra Pro
 ├── OrbbecSDK/                    ← SDK Orbbec (clonado, .gitignored)
 │   └── lib/arm64/*.so            ← bibliotecas nativas ARM
@@ -1035,6 +1319,32 @@ vesc_read.py
 ├── Historico (deque maxlen=600, timestamp + time_label)
 ├── Rotas Flask (~15 endpoints REST)
 └── Template inline com Chart.js (graficos de tensao, corrente, RPM, duty, potencia, temperatura)
+
+can_setup.py
+├── Listagem de dispositivos seriais (/dev/serial/by-id/*, ttyACM*, ttyUSB*)
+├── Comandos de sistema (modprobe, pkill, slcand, ip link, cansend, candump)
+├── Validacao (regex para iface, ID CAN, dados CAN)
+├── Monitor SSE (candump -tz → EventStream para o navegador)
+├── Rotas Flask (~7 endpoints REST + 1 SSE)
+└── Template inline Bootstrap 5 escuro (~420 linhas HTML/CSS/JS)
+
+3dcam.py
+├── RGB via OpenCV V4L2 (MJPG fourcc, auto-deteccao Astra Pro HD Camera)
+├── Depth via OrbbecSDK v1 bridge (subprocesso C++ → /tmp/*.raw + *.json)
+├── Colormap + overlay (TURBO/JET/etc, legendas, grid de distancias, contornos)
+├── Correcoes USB (autosuspend, usbfs_memory_mb, power/control, unbind/bind)
+├── Threads: rgb_worker + depth_worker (bridge manager com restart automatico)
+├── Rotas Flask (~10 endpoints REST + 2 streams MJPEG)
+└── Template inline Bootstrap 5 escuro (~597 linhas HTML/CSS/JS)
+
+lidar.py
+├── Serial reader (pyserial, protocolo LDROBOT 0x54, CRC XOR, 47-byte frames)
+├── Canvas 2D (radar com sweep, grid polar, aneis de distancia, pontos coloridos)
+├── Deteccao de objetos (cluster por distancia/angulo, labels numerados)
+├── Preview 3D (Three.js + OrbitControls, esferas de extremos, grid, eixos)
+├── Exportacao (PNG canvas, JSON completo, CSV tabela, PLY nuvem 3D)
+├── Rotas Flask (~2 endpoints REST)
+└── Template inline completo (~2248 linhas HTML/CSS/JS) com Three.js CDN
 ```
 
 ### Threads — gamepad_web_can_flipsky.py
@@ -1058,6 +1368,22 @@ vesc_read.py
 - **vesc_reader_loop** (daemon): loop infinito lendo telemetria do VESC via serial USB com pyvesc, processa comandos de motor test, mantem auto-stop por tempo/fault, escreve no deque de historico
 - **TCP Bridge threads** (2 daemon, sob demanda): `bridge_socket_to_serial` e `bridge_serial_to_socket` — ponte bidirecional serial↔TCP para uso simultaneo com VESC Tool
 
+### Threads — can_setup.py
+
+- **Main thread**: servidor Flask
+- Sem threads adicionais — opera sob demanda via chamadas REST. O `candump` e lancado como subprocesso com `subprocess.Popen` e transmitido via SSE (Server-Sent Events)
+
+### Threads — 3dcam.py
+
+- **Main thread**: servidor Flask
+- **rgb_worker** (daemon): loop infinito lendo frames do OpenCV (`/dev/video2`), aplica mirror se configurado, atualiza `latest_rgb`
+- **depth_worker** (daemon): gerencia o bridge OrbbecSDK (subprocesso C++), monitora arquivos `/tmp/orbbec_depth.raw` e `.meta.json`, aplica colormap + overlay de distancias, atualiza `latest_depth_colored`. Auto-restart do bridge com cooldown de 25s
+
+### Threads — lidar.py
+
+- **Main thread**: servidor Flask
+- **serial_worker** (daemon): loop infinito lendo frames de 47 bytes do protocolo LDROBOT via pyserial (`/dev/ttyUSB0`, 230400 baud). Parse CRC XOR, atualiza bins de angulo (720 bins, 0.5° cada), reconecta automaticamente em caso de erro serial
+
 ### Comunicacao
 
 **gamepad_web_can_flipsky.py:**
@@ -1069,6 +1395,25 @@ vesc_read.py
 - **Servidor ↔ LiDAR**: `pyserial` na porta `/dev/ttyUSB0` a 230400 baud
 - **Servidor ↔ Modem A76XX**: `pyserial` na porta `/dev/ttyUSB1` a 115200 baud (AT commands + streaming GPS)
 - **Servidor ↔ Depth Camera**: `ob_depth.py` (ctypes) → `libOrbbecSDK.so` via USB
+
+**can_setup.py:**
+
+- **Browser ↔ Servidor**: REST API para configuracao CAN, envio de frames, status da interface
+- **Browser ↔ Servidor**: SSE (Server-Sent Events) para monitor de trafego CAN em tempo real (`candump -tz`)
+- **Servidor ↔ CAN bus**: `subprocess.Popen` com `slcand`, `cansend`, `candump`, `ip link`
+
+**3dcam.py:**
+
+- **Browser ↔ Servidor**: REST API para controle da camera, status, estatisticas de depth
+- **Browser ↔ Servidor**: MJPEG (`multipart/x-mixed-replace`) para streams de RGB e depth
+- **Servidor ↔ RGB Camera**: OpenCV V4L2 via `/dev/video2` (MJPG fourcc)
+- **Servidor ↔ Depth Camera**: Subprocesso C++ (OrbbecSDK v1 bridge) escrevendo em `/tmp/` + leitura via numpy
+
+**lidar.py:**
+
+- **Browser ↔ Servidor**: REST API para nuvem de pontos e status do LiDAR
+- **Servidor ↔ LiDAR**: `pyserial` na porta `/dev/ttyUSB0` a 230400 baud (protocolo LDROBOT 0x54)
+- **Browser ↔ Three.js CDN**: Carrega `three.min.js` e `OrbitControls.js` do CDN para preview 3D
 
 **vesc_controller.py:**
 
