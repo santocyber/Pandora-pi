@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="pt-BR">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Face do Robô</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='face.css') }}" />
+  </head>
+  <body data-emotion="{{ initial_state }}">
+    <main class="screen">
+      <div class="face-area">
+        <div id="scene3d" aria-label="Face 3D do robô"></div>
+        <button
+          id="settingsButton"
+          class="settings-button"
+          type="button"
+          aria-controls="controlPanel"
+          aria-expanded="false"
+          aria-label="Abrir painel de controle"
+        >
+          ⚙
+        </button>
+        <div id="modelLoading" class="model-loading">Carregando modelo...</div>
+        <div id="captionOverlay" class="caption-overlay" aria-live="polite">
+          <span id="mainCaptionText"></span>
+        </div>
+      </div>
+
+      <div id="panelBackdrop" class="panel-backdrop hidden"></div>
+
+      <section id="controlPanel" class="panel panel-modal hidden" role="dialog" aria-modal="true" aria-label="Controle de expressão">
+        <button
+          id="panelClose"
+          class="panel-close"
+          type="button"
+          aria-label="Fechar painel de controle"
+        >
+          Fechar
+        </button>
+
+        <div id="panelContent" class="panel-content">
+          <p class="eyebrow">Python Flask</p>
+          <p id="statusText" class="status">Estado atual: {{ emotions[initial_state] }}</p>
+
+          <div class="buttons" role="group" aria-label="Selecionar emoção">
+            {% for emotion, label in emotions.items() %}
+              <button
+                type="button"
+                class="emotion-button{% if emotion == initial_state %} active{% endif %}"
+                data-set-emotion="{{ emotion }}"
+              >
+                {{ label }}
+              </button>
+            {% endfor %}
+          </div>
+
+          <form id="speechForm" class="speech-form">
+            <label class="speech-label" for="speechText">Texto para o robô falar</label>
+            <textarea
+              id="speechText"
+              class="speech-input"
+              rows="3"
+              placeholder="Digite uma frase para testar a fala..."
+            ></textarea>
+            <div class="tts-options">
+              <label>
+                Motor
+                <select id="ttsProvider" class="tts-select">
+                  <option value="auto">Auto</option>
+                  <option value="edge">Edge online</option>
+                  <option value="piper">Piper offline</option>
+                  <option value="espeak">Espeak fallback</option>
+                </select>
+              </label>
+              <label>
+                Voz
+                <select id="ttsVoice" class="tts-select">
+                  <option value="female">Feminina</option>
+                  <option value="male">Masculina</option>
+                </select>
+              </label>
+            </div>
+            <div class="speech-actions">
+              <button id="speakButton" class="speech-button" type="submit">Falar</button>
+              <button id="clearSpeechButton" class="speech-button secondary" type="button">Limpar</button>
+            </div>
+            <p id="speechStatus" class="speech-status"></p>
+          </form>
+
+          <button id="calToggle" class="cal-toggle" type="button">⚙️ Calibração</button>
+          <div id="calSection" class="cal-section hidden">
+            <p class="speech-label">Braço Esquerdo</p>
+            <div class="cal-row"><label>Upper X</label><input type="range" class="cal-slider" data-cal="armX_L" min="-3.14" max="3.14" step="0.01"><span class="cal-val">-1.20</span></div>
+            <div class="cal-row"><label>Upper Y</label><input type="range" class="cal-slider" data-cal="armY_L" min="-3.14" max="3.14" step="0.01"><span class="cal-val">0.00</span></div>
+            <div class="cal-row"><label>Upper Z</label><input type="range" class="cal-slider" data-cal="armZ_L" min="-3.14" max="3.14" step="0.01"><span class="cal-val">0.00</span></div>
+            <div class="cal-row"><label>Lower X</label><input type="range" class="cal-slider" data-cal="lowerX_L" min="-3.14" max="3.14" step="0.01"><span class="cal-val">2.00</span></div>
+            <p class="speech-label" style="margin-top:0.5rem">Braço Direito</p>
+            <div class="cal-row"><label>Upper X</label><input type="range" class="cal-slider" data-cal="armX_R" min="-3.14" max="3.14" step="0.01"><span class="cal-val">-1.40</span></div>
+            <div class="cal-row"><label>Upper Y</label><input type="range" class="cal-slider" data-cal="armY_R" min="-3.14" max="3.14" step="0.01"><span class="cal-val">0.00</span></div>
+            <div class="cal-row"><label>Upper Z</label><input type="range" class="cal-slider" data-cal="armZ_R" min="-3.14" max="3.14" step="0.01"><span class="cal-val">0.00</span></div>
+            <div class="cal-row"><label>Lower X</label><input type="range" class="cal-slider" data-cal="lowerX_R" min="-3.14" max="3.14" step="0.01"><span class="cal-val">0.00</span></div>
+            <button id="calCopyBtn" class="speech-button" type="button" style="margin-top:0.7rem">📋 Copiar código</button>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <script>
+      window.ROBOT_FACE_INITIAL_STATE = "{{ initial_state }}";
+      window.ROBOT_FACE_LABELS = {{ emotions | tojson }};
+    </script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/loaders/GLTFLoader.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+    <script src="{{ url_for('static', filename='face3d.js') }}"></script>
+    <script src="{{ url_for('static', filename='face.js') }}" defer></script>
+  </body>
+</html>

@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="pt-BR">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Legenda do Robô</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='face.css') }}" />
+  </head>
+  <body class="caption-page" data-emotion="{{ speech.emotion }}">
+    <main class="caption-screen">
+      <p class="caption-eyebrow">Legenda</p>
+      <p id="captionText" class="caption-text{% if speech.text %} visible{% endif %}">
+        {{ speech.text or "Aguardando fala do robô..." }}
+      </p>
+    </main>
+
+    <script>
+      async function pollCaption() {
+        try {
+          const response = await fetch("/api/speech", { cache: "no-store" });
+          const data = await response.json();
+          document.body.dataset.emotion = data.emotion || "neutro";
+          const caption = document.querySelector("#captionText");
+          caption.textContent = data.text || "Aguardando fala do robô...";
+          caption.classList.toggle("visible", Boolean(data.text));
+        } catch {}
+      }
+      pollCaption();
+      setInterval(pollCaption, 500);
+    </script>
+  </body>
+</html>

@@ -1,6 +1,6 @@
-# PandoraPi — Gamepad Bluetooth + CAN Flipsky + Monitor VESC + LiDAR + GPS A76XX + Depth Camera + Follow Autonomo + Painel CAN + Radar LiDAR + Camera 3D
+# PandoraPi — Gamepad Bluetooth + CAN Flipsky + Monitor VESC + LiDAR + GPS A76XX + Depth Camera + Follow Autonomo + Painel CAN + Radar LiDAR + Camera 3D + Face do Robo (chibi 3D)
 
-Seis aplicacoes web que transformam um Raspberry Pi em uma central de controle para robos com tracao diferencial usando controladores **Flipsky 75100 (VESC)** conectados via barramento **CAN** e/ou serial USB.
+Sete aplicacoes web que transformam um Raspberry Pi em uma central de controle para robos com tracao diferencial usando controladores **Flipsky 75100 (VESC)** conectados via barramento **CAN** e/ou serial USB.
 
 ### `gamepad_web_can_flipsky.py` (porta 5005)
 Controle via **gamepad Bluetooth HID** (Nintendo Switch Pro Controller ou qualquer controle compativel com evdev). **LiDAR LDROBOT STL-06P** integrado como radar de navegacao com nuvem de pontos 2D persistente (time-decay de 3 segundos). **GPS via modem SIMCom A76XX LTE** com visualizacao em mapa Leaflet, constelacao de satelites em canvas, gravacao de trajeto com exportacao GPX/JSON, upload de rota GPX e navegacao autonoma (follow) com desvio de obstaculos via LiDAR. **Depth Camera Orbbec Astra Pro** com streaming de profundidade colorizada (colormap JET) via `ob_depth.py` (wrapper ctypes). **Freio regenerativo** no botao B (`CAN_PACKET_SET_CURRENT_BRAKE`, 8A configuravel).
@@ -19,6 +19,9 @@ Controlador simplificado e modular com suporte a **gamepad Bluetooth HID (evdev)
 
 ### `lidar.py` (porta 5010)
 Radar visual para o **LiDAR LDROBOT STL-06P** — nuvem de pontos 2D em canvas com sweep animado, aneis de alcance (bands coloridas), deteccao de objetos agrupados por proximidade (cluster), marcadores de ponto mais proximo/longe, regua de escala, **preview 3D** via Three.js com OrbitControls (girar, zoom, pan). Exportacao completa nos formatos **PNG, JSON, CSV e PLY** com coordenadas em metros, cores por distancia e confianca.
+
+### `emotion-face-web/face.py` (porta 5011)
+**Face 3D do robo** com modelo chibi animado via Three.js — expressoes faciais (morph targets), movimentos corporais (bracos, pernas, tronco, ombros), sincronia labial com TTS (edge-tts, piper, espeak), painel de controle com emocoes, fala e calibracao interativa dos bracos. Modelo GLB exportado do Blender com texturas embutidas. Full-screen responsivo com degrades e cores por emocao.
 
 ![Interface PandoraPi](assets/screenshot.png)
 
@@ -216,6 +219,34 @@ Navegador (http://IP_DO_PI:5010)
 │  Preview 3D com OrbitControls │
 │  Esferas extremos, grid, eixos│
 │  Export PNG/JSON/CSV/PLY      │
+└───────────────────────────────┘
+```
+
+### `emotion-face-web/face.py` (porta 5011)
+
+```
+Navegador (http://IP_DO_PI:5011)
+        │
+        ▼ REST API (JSON)
+┌───────────────────────────────┐
+│         Flask Server          │
+│  - GET / → template HTML     │
+│  - GET /api/emotion           │
+│  - POST /api/emotion          │
+│  - GET/POST /api/speech       │
+│  - POST /api/speech/clear     │
+│  - GET /api/tts/voices        │
+├───────────────────────────────┤
+│  Thread: speak_text_async     │
+│  edge-tts / piper / espeak    │──► Audio system (aplay/ffplay)
+│  Sincronia labial via visemas │
+├───────────────────────────────┤
+│  Frontend Three.js            │
+│  Modelo chibi GLB + animacao  │
+│  Morph targets faciais        │
+│  Rig: bracos, pernas, tronco  │
+│  Painel de controle (modal)   │
+│  Calibracao interativa        │
 └───────────────────────────────┘
 ```
 
@@ -474,6 +505,32 @@ cam.close()
 ```
 
 > A camera depth so funciona em **Raspberry Pi (aarch64/arm64)**. Em x86_64, `ob_depth.py` exibe um erro claro de arquitetura.
+
+### Compilando o bridge C++ do Orbbec (`orbbec_depth_bridge`)
+
+O bridge nativo que faz a captura de profundidade (`orbbec_depth_bridge`) precisa ser compilado no Raspberry Pi (ARM64). O comando abaixo detecta automaticamente o `libOrbbecSDK.so` correto para a arquitetura e compila:
+
+```bash
+OBSDK_SO=$(find "$PWD/lib" -name "libOrbbecSDK.so*" | while read f; do file -L "$f" | grep -qi "aarch64\|ARM aarch64" && echo "$f" && break; done)
+
+if [ -z "$OBSDK_SO" ]; then
+  echo "ERRO: não encontrei libOrbbecSDK.so ARM64 dentro de ./lib"
+  exit 1
+fi
+
+OBSDK_LIBDIR=$(dirname "$OBSDK_SO")
+
+g++ -std=c++17 -O2 \
+  orbbec_depth_bridge.cpp \
+  -o orbbec_depth_bridge \
+  -I"$PWD/include" \
+  -L"$OBSDK_LIBDIR" \
+  -lOrbbecSDK \
+  -Wl,-rpath,"$OBSDK_LIBDIR" \
+  -lpthread -ldl -ludev -lusb-1.0
+```
+
+> O binario gerado (`orbbec_depth_bridge`) e usado pelo `3dcam.py` como subprocesso para captura de profundidade.
 
 ## VESC Controller (`vesc_controller.py`) — porta 5009
 
@@ -790,11 +847,23 @@ Todos os formatos usam os pontos visiveis dentro do alcance configurado:
 | **CSV** | `.csv` | Tabela: index, angulo, distancia (mm/m), coordenadas (m), cores RGB |
 | **PLY** | `.ply` | Nuvem 2D: vertex com x, y, z=0, cores, distancia, angulo, confianca. Abre no MeshLab/CloudCompare/Blender |
 
+### `emotion-face-web/face.py` (porta 5011)
+
+| Metodo | Rota | Descricao |
+|---|---|---|
+| `GET` | `/` | Interface web com modelo 3D e painel de controle |
+| `GET` | `/api/emotion` | Estado atual da emocao |
+| `POST` | `/api/emotion` | Alterar emocao (`{"state": "feliz"}`) |
+| `GET` | `/api/speech` | Estado atual da fala (texto, speaking, TTS available) |
+| `POST` | `/api/speech` | Enviar texto para TTS (`{"text": "...", "emotion": "falando", "tts": true}`) |
+| `POST` | `/api/speech/clear` | Limpar fala atual |
+| `GET` | `/api/tts/voices` | Listar provedores TTS disponiveis (edge, piper, espeak) |
+
 ---
 
 ## Como rodar
 
-O projeto tem **seis aplicacoes independentes**. Rode uma ou mais conforme necessario:
+O projeto tem **sete aplicacoes independentes**. Rode uma ou mais conforme necessario:
 
 ```bash
 # Aplicacao principal — gamepad + CAN + LiDAR + GPS + Depth + Follow
@@ -820,6 +889,10 @@ python vesc_controller.py
 # Radar LiDAR — STL-06P com preview 3D e exportacao
 python lidar.py
 # Acesse: http://<IP_DO_RASPBERRY>:5010
+
+# Face 3D do robo — modelo chibi com expressoes e TTS
+python emotion-face-web/face.py
+# Acesse: http://<IP_DO_RASPBERRY>:5011
 ```
 
 > **Por que sudo?** O `gamepad_web_can_flipsky.py` e o `3dcam.py` precisam executar `ip link set can0 up type can bitrate 500000` para ativar a interface CAN **e** acessar a porta serial `/dev/ttyUSB0` do LiDAR / aplicar correcoes USB (autosuspend, usbfs_memory_mb) para a depth camera. Se for usar apenas o gamepad sem CAN/LiDAR, pode rodar como usuario normal desde que esteja no grupo `input`:
@@ -832,7 +905,7 @@ python lidar.py
 >
 > O `can_setup.py`, `vesc_read.py`, `vesc_controller.py` e `lidar.py` rodam como usuario normal, desde que esteja no grupo `dialout` para acesso a serial `/dev/ttyACM0` ou `/dev/ttyUSB0`. Para modo CAN no `vesc_controller.py`, `sudo` e necessario para `ip link`.
 
-Acesse no navegador: **http://<IP_DO_RASPBERRY>:5005** (gamepad/CAN), **http://<IP_DO_RASPBERRY>:5006** (painel CAN), **http://<IP_DO_RASPBERRY>:5007** (camera 3D), **http://<IP_DO_RASPBERRY>:5008** (monitor VESC), **http://<IP_DO_RASPBERRY>:5009** (controller simplificado) e **http://<IP_DO_RASPBERRY>:5010** (radar LiDAR).
+Acesse no navegador: **http://<IP_DO_RASPBERRY>:5005** (gamepad/CAN), **http://<IP_DO_RASPBERRY>:5006** (painel CAN), **http://<IP_DO_RASPBERRY>:5007** (camera 3D), **http://<IP_DO_RASPBERRY>:5008** (monitor VESC), **http://<IP_DO_RASPBERRY>:5009** (controller simplificado), **http://<IP_DO_RASPBERRY>:5010** (radar LiDAR) e **http://<IP_DO_RASPBERRY>:5011** (face do robo).
 
 Na inicializacao cada script exibe no terminal as instrucoes de dependencias, diagnostico e comandos uteis.
 
@@ -996,6 +1069,21 @@ Na inicializacao cada script exibe no terminal as instrucoes de dependencias, di
 | **Exportacao** | Botoes PNG, JSON, CSV, PLY com download automatico (timestamp no nome do arquivo) |
 | **Legenda de distancia** | 7 faixas de cor: 0-0.5m (vermelho), 0.5-1m (laranja), 1-2m (amarelo), 2-4m (verde), 4-6m (ciano), 6-8m (azul), >8m (roxo) |
 | **Preview 3D** | Three.js com OrbitControls. Esferas de extremos (vermelha/roxa), grid 16m, eixos XYZ. 10 botoes de camera predefinida (topo/lateral/frente/traseira/esquerda/direita/isometrica/1ª pessoa/ver perto/ver longe/reset). Tamanho 3D dos pontos e altura visual Z ajustaveis |
+
+### `emotion-face-web/face.py` (porta 5011)
+
+| Secao | Funcao |
+|---|---|
+| **Emocoes** | 7 estados: Neutro, Feliz, Triste, Pensando, Falando, Erro, Assustado. Cada um com morph targets faciais, postura corporal, cores de fundo e glow |
+| **Expressoes faciais** | Morph targets: `Fcl_ALL_Joy/Sorrow/Surprised/Fun`, `Fcl_EYE_*`, `Fcl_BRW_*`, `Fcl_MTH_*`, `Fcl_HA_Hide/Short`. Blink periodico (~7s). Visemas (A/I/U/E/O) sincronizados com TTS |
+| **Movimentos corporais** | Bracos oscilam, pernas alternam, tronco torce, ombros balancam, bounce vertical. Intensidade varia por emocao |
+| **Calibracao interativa** | Sliders no painel para ajustar rotacao X/Y/Z de cada braco (upper/lower) em tempo real. Botao "Copiar codigo" gera JSON do preset |
+| **TTS** | edge-tts (online), piper (offline), espeak (fallback). Voz feminina/masculina. Sincronia labial com visemas |
+| **Fala manual** | Formulario de texto no painel com selecao de motor TTS e voz |
+| **API REST** | `GET/POST /api/speech`, `POST /api/speech/clear`, `POST /api/emotion`, `GET /api/tts/voices` |
+| **Painel de controle** | Modal full-screen com botoes de emocao, formulario de fala, seccao de calibracao. Abre por botao de engrenagem no topo direito |
+| **Fundo dinamico** | Degrade radial + glow + grid scanline por emocao. Transicao suave via CSS variables |
+| **Modelo 3D chibi** | GLB exportado do Blender (~14MB). Texturas embutidas. Materiais corrigidos para alpha (cabelo, olhos, sobrancelhas). 3.4× escalado, rotacionado 180° no Y para frente |
 
 ## Configuracao
 
@@ -1257,7 +1345,7 @@ sudo apt install python3-evdev
 
 ## Arquitetura do codigo
 
-O projeto consiste em **seis aplicacoes Flask independentes** mais `ob_depth.py` (wrapper ctypes, ~234 linhas) e arquivos de suporte:
+O projeto consiste em **sete aplicacoes Flask independentes** mais `ob_depth.py` (wrapper ctypes, ~234 linhas), `emotion-face-web/` e arquivos de suporte:
 
 ```
 pandorapi/
@@ -1414,6 +1502,13 @@ lidar.py
 - **Browser ↔ Servidor**: REST API para nuvem de pontos e status do LiDAR
 - **Servidor ↔ LiDAR**: `pyserial` na porta `/dev/ttyUSB0` a 230400 baud (protocolo LDROBOT 0x54)
 - **Browser ↔ Three.js CDN**: Carrega `three.min.js` e `OrbitControls.js` do CDN para preview 3D
+
+**emotion-face-web/face.py:**
+
+- **Browser ↔ Servidor**: REST API (~7 endpoints) para emocao, fala, TTS
+- **Servidor ↔ TTS**: Subprocesso edge-tts / piper / espeak para geracao de audio
+- **Frontend ↔ Three.js**: Modelo chibi GLB carregado via Three.js, animado com morph targets e rig procedural
+- **Frontend**: Modelo chibi 3D full-screen com painel modal de controle, sliders de calibracao, sincronia labial
 
 **vesc_controller.py:**
 

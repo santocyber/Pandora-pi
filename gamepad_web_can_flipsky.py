@@ -280,6 +280,10 @@ follow_state: Dict[str, Any] = {
     "bearing": 0.0,
     "throttle": 0.0,
     "steering": 0.0,
+    "nav_steering": 0.0,
+    "nav_throttle": 0.0,
+    "avoidance_loop_active": False,
+    "avoidance_loop_hz": 0.0,
     "error": None
 }
 
@@ -289,6 +293,7 @@ follow_config: Dict[str, Any] = {
     "steering_kp": 0.5,
     "avoidance_enabled": True,
     "avoidance_weight": 0.5,
+    "avoidance_loop_hz": 20,
     "safe_distance_mm": 500,
     "critical_distance_mm": 300
 }
@@ -1670,6 +1675,7 @@ HTML_PAGE = r"""
                 </div>
                 <div id="gpsFollowProgress" style="display:none;margin-top:6px;font-size:13px;color:#22c55e;">
                     WP <span id="followWpIndex">0</span>/<span id="followWpTotal">0</span> &middot; <span id="followDist">0</span>m &middot; <span id="followSpeed">0.0</span> km/h
+                    <span id="avoidanceLoopIndicator" style="display:none;color:#a78bfa;font-size:11px;margin-left:4px;">&middot; AVOID <span id="avoidanceLoopHz">0</span>Hz</span>
                 </div>
                 <div style="margin-top:6px;display:grid;grid-template-columns:1fr 1fr;gap:6px;">
                     <div>
@@ -1687,6 +1693,12 @@ HTML_PAGE = r"""
                     <input type="checkbox" id="gpsAvoidance" checked onchange="gpsToggleAvoidance()">
                     &#128737; Desviar de obstaculos (LiDAR)
                 </label>
+                <div style="margin-top:2px;display:flex;align-items:center;gap:4px;">
+                    <label style="font-size:10px;color:#94a3b8;">Loop avoid:</label>
+                    <input id="avoidanceLoopHzCfg" type="number" min="5" max="50" value="20"
+                           style="width:42px;padding:2px;font-size:10px;" onchange="gpsSaveAvoidanceHz()">
+                    <span style="font-size:10px;color:#64748b;">Hz</span>
+                </div>
             </div>
 
             <div class="gps-config-row" style="margin-top:6px;">
@@ -3240,11 +3252,22 @@ HTML_PAGE = r"""
             byId("followWpTotal").textContent = data.wp_total || 0;
             byId("followDist").textContent = data.distance || 0;
             if (gpsLastSpeed) byId("followSpeed").textContent = gpsLastSpeed;
+            // Show high-frequency avoidance loop indicator
+            const loopActive = data.avoidance_loop_active || false;
+            const loopHz = data.avoidance_loop_hz || 0;
+            const loopInd = byId("avoidanceLoopIndicator");
+            if (loopActive && loopHz > 0) {
+                loopInd.style.display = "inline";
+                byId("avoidanceLoopHz").textContent = loopHz;
+            } else {
+                loopInd.style.display = "none";
+            }
         } else {
             byId("gpsFollowProgress").style.display = "none";
             byId("followWpIndex").textContent = "0";
             byId("followWpTotal").textContent = "0";
             byId("followDist").textContent = "0";
+            byId("avoidanceLoopIndicator").style.display = "none";
             if (gpsWaypointMarker && gpsMap) gpsMap.removeLayer(gpsWaypointMarker);
             gpsWaypointMarker = null;
         }
@@ -3450,6 +3473,17 @@ HTML_PAGE = r"""
         } catch (e) {}
     }
 
+    async function gpsSaveAvoidanceHz() {
+        const hz = parseInt(byId("avoidanceLoopHzCfg").value) || 20;
+        try {
+            await fetch("/api/gps/follow/config", {
+                method: "PUT",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ avoidance_loop_hz: Math.max(5, Math.min(50, hz)) })
+            });
+        } catch (e) {}
+    }
+
     async function gpsLoadFollowConfig() {
         try {
             const resp = await fetch("/api/gps/follow/config");
@@ -3457,6 +3491,7 @@ HTML_PAGE = r"""
             byId("gpsSafeDist").value = Math.round((cfg.safe_distance_mm || 500) / 10);
             byId("gpsCritDist").value = Math.round((cfg.critical_distance_mm || 300) / 10);
             byId("gpsAvoidance").checked = cfg.avoidance_enabled !== false;
+            byId("avoidanceLoopHzCfg").value = cfg.avoidance_loop_hz || 20;
         } catch (e) {}
     }
 
@@ -5948,6 +5983,10 @@ def emit_gps_follow_status() -> None:
             "bearing": follow_state["bearing"],
             "throttle": follow_state["throttle"],
             "steering": follow_state["steering"],
+            "nav_steering": follow_state.get("nav_steering", 0.0),
+            "nav_throttle": follow_state.get("nav_throttle", 0.0),
+            "avoidance_loop_active": follow_state.get("avoidance_loop_active", False),
+            "avoidance_loop_hz": follow_state.get("avoidance_loop_hz", 0.0),
             "error": follow_state["error"]
         }
     socketio.emit("gps_follow_status", payload)
@@ -5993,6 +6032,116 @@ def update_lidar_obstacle_map(points: List[Dict[str, Any]]) -> None:
         lidar_obstacle_data["min_front_dist"] = min_front if min_front <= safe_mm else None
 
 
+def avoidance_control_loop() -> None:
+    """
+    High-frequency obstacle avoidance control loop (~20 Hz).
+    Runs independently from the GPS thread, continuously blending
+    nav steering/throttle from GPS with fresh LiDAR obstacle data.
+
+    This ensures the robot reacts to obstacles within ~50ms instead
+    of waiting for the next GPS update (~1Hz).
+    """
+    interval = 0.05  # target 20 Hz
+    last_hz_update = 0.0
+    cycle_count = 0
+
+    # Mark loop inactive initially
+    with follow_lock:
+        follow_state["avoidance_loop_active"] = False
+        follow_state["avoidance_loop_hz"] = 0.0
+
+    while True:
+        loop_start = time.time()
+        try:
+            # Only active during GPS follow mode
+            with follow_lock:
+                active = follow_state.get("active", False)
+                nav_steering = follow_state.get("nav_steering", 0.0)
+                nav_throttle = follow_state.get("nav_throttle", 0.0)
+
+            if not active:
+                with follow_lock:
+                    follow_state["avoidance_loop_active"] = False
+                    follow_state["avoidance_loop_hz"] = 0.0
+                time.sleep(interval)
+                continue
+
+            if not robot_state.get("armed", False):
+                with follow_lock:
+                    follow_state["avoidance_loop_active"] = False
+                robot_stop()
+                time.sleep(interval)
+                continue
+
+            # Mark loop active
+            with follow_lock:
+                follow_state["avoidance_loop_active"] = True
+
+            # Read latest LiDAR obstacle data
+            with lidar_obstacle_lock:
+                lidar_active = lidar_obstacle_data.get("active", True)
+                emergency = lidar_obstacle_data.get("emergency_stop", False)
+                avoidance = lidar_obstacle_data.get("avoidance_steering", 0.0)
+                min_front = lidar_obstacle_data.get("min_front_dist")
+
+            # If LiDAR avoidance is disabled, just forward raw nav commands
+            if not lidar_active:
+                steering = nav_steering
+                throttle = nav_throttle
+            else:
+                # Emergency stop takes maximum priority
+                if emergency:
+                    robot_stop()
+                    time.sleep(interval)
+                    continue
+
+                # Blend navigation with avoidance steering
+                weight = follow_config.get("avoidance_weight", 0.5)
+                steering = nav_steering
+                throttle = nav_throttle
+
+                if abs(avoidance) > 0.01:
+                    steering = nav_steering * (1.0 - weight) + avoidance * weight
+                    steering = max(-1.0, min(1.0, steering))
+
+                # Reduce throttle when obstacle is close ahead
+                safe_mm = follow_config.get("safe_distance_mm", 500)
+                if min_front is not None and min_front < safe_mm and min_front > 0:
+                    factor = min_front / safe_mm
+                    throttle *= max(0.0, factor)
+                    if throttle < 0.01:
+                        throttle = 0.0
+
+                # Clamp
+                throttle = max(-1.0, min(1.0, throttle))
+
+            # Send motor commands
+            left_raw = throttle + steering
+            right_raw = throttle - steering
+            left = max(-1.0, min(1.0, left_raw))
+            right = max(-1.0, min(1.0, right_raw))
+            robot_send_duty(left, right, force=True)
+
+            # Track actual loop frequency
+            cycle_count += 1
+            now = time.time()
+            if now - last_hz_update >= 1.0:
+                actual_hz = cycle_count / (now - last_hz_update)
+                with follow_lock:
+                    follow_state["avoidance_loop_hz"] = round(actual_hz, 1)
+                cycle_count = 0
+                last_hz_update = now
+
+        except Exception:
+            # Ensure loop keeps running even on transient errors
+            pass
+
+        # Maintain consistent loop rate
+        elapsed = time.time() - loop_start
+        sleep_time = max(0.0, interval - elapsed)
+        time.sleep(sleep_time)
+
+
 def gps_follow_step() -> None:
     if not follow_state["active"]:
         return
@@ -6036,7 +6185,13 @@ def gps_follow_step() -> None:
     steering = max(-1.0, min(1.0, hdg_error * kp))
     throttle = min(follow_config["max_auto_speed"], max(0.01, distance * 0.04))
 
-    if lidar_obstacle_data.get("active", True):
+    # Store raw nav values before avoidance blending (for the high-frequency avoidance loop)
+    nav_steering = steering
+    nav_throttle = throttle
+
+    # Apply avoidance blending for the GPS-level display values
+    avoidance_active = lidar_obstacle_data.get("active", True)
+    if avoidance_active:
         with lidar_obstacle_lock:
             emergency = lidar_obstacle_data.get("emergency_stop", False)
             avoidance = lidar_obstacle_data.get("avoidance_steering", 0.0)
@@ -6072,16 +6227,25 @@ def gps_follow_step() -> None:
             return
         emit_gps_follow_status()
         return
-    left_raw = throttle + steering
-    right_raw = throttle - steering
-    left = max(-1.0, min(1.0, left_raw))
-    right = max(-1.0, min(1.0, right_raw))
-    robot_send_duty(left, right, force=True)
+
+    # If the high-frequency avoidance loop is running, delegate motor control to it.
+    # Otherwise, send motor commands directly as fallback.
+    with follow_lock:
+        avoidance_loop_running = follow_state.get("avoidance_loop_active", False)
+    if not avoidance_loop_running:
+        left_raw = throttle + steering
+        right_raw = throttle - steering
+        left = max(-1.0, min(1.0, left_raw))
+        right = max(-1.0, min(1.0, right_raw))
+        robot_send_duty(left, right, force=True)
+
     with follow_lock:
         follow_state["distance"] = round(distance, 1)
         follow_state["bearing"] = round(bearing, 1)
         follow_state["throttle"] = round(throttle, 3)
         follow_state["steering"] = round(steering, 3)
+        follow_state["nav_throttle"] = round(nav_throttle, 4)
+        follow_state["nav_steering"] = round(nav_steering, 4)
         follow_state["error"] = None
     emit_gps_follow_status()
 
@@ -6104,6 +6268,8 @@ def follow_start() -> Dict[str, Any]:
         follow_state["bearing"] = 0.0
         follow_state["throttle"] = 0.0
         follow_state["steering"] = 0.0
+        follow_state["nav_steering"] = 0.0
+        follow_state["nav_throttle"] = 0.0
         follow_state["error"] = None
     _gps_log("info", f"Follow iniciado: {len(points)} waypoints")
     emit_gps_follow_status()
@@ -6644,7 +6810,9 @@ def api_follow_config_get():
         "safe_distance_mm": follow_config.get("safe_distance_mm", 500),
         "critical_distance_mm": follow_config.get("critical_distance_mm", 300),
         "avoidance_weight": follow_config.get("avoidance_weight", 0.5),
-        "avoidance_enabled": lidar_obstacle_data.get("active", True)
+        "avoidance_enabled": lidar_obstacle_data.get("active", True),
+        "avoidance_loop_hz": follow_config.get("avoidance_loop_hz", 20),
+        "avoidance_loop_active": follow_state.get("avoidance_loop_active", False)
     })
 
 
@@ -6667,6 +6835,10 @@ def api_follow_config_update():
     if "avoidance_enabled" in data:
         lidar_obstacle_data["active"] = bool(data["avoidance_enabled"])
         updated["avoidance_enabled"] = lidar_obstacle_data["active"]
+    if "avoidance_loop_hz" in data:
+        val = max(5, min(50, int(data.get("avoidance_loop_hz", 20))))
+        follow_config["avoidance_loop_hz"] = val
+        updated["avoidance_loop_hz"] = val
     _gps_log("info", f"Config avoidance: {json.dumps(updated)}")
     return jsonify(updated)
 
@@ -7045,6 +7217,13 @@ if __name__ == "__main__":
         daemon=True
     )
     gps_thread.start()
+
+    avoidance_thread = threading.Thread(
+        target=avoidance_control_loop,
+        daemon=True,
+        name="avoidance-ctrl"
+    )
+    avoidance_thread.start()
 
     if get_depth_config().get("enabled", True):
         depth_thread = threading.Thread(
